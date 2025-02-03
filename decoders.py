@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from abc import ABCMeta, abstractmethod
 from utils.ctf import fourier_to_primal_3D
 from utils.nets import SIREN, FCBlock, FourierNet
+import mrcfile
 
 
 class Explicit3D(nn.Module):
@@ -14,6 +15,9 @@ class Explicit3D(nn.Module):
         self.D = downsampled_sz + 1
         self.img_sz = img_sz
         self.D2 = img_sz + 1
+        
+        
+        # Original random initialization
         if hartley:
             self.fvol = torch.nn.Parameter(torch.randn(1, 2, self.D2, self.D2, self.D2))
         else:

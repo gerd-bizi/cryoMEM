@@ -5,11 +5,13 @@ import sys
 import numpy as np
 import torch
 import os
+import healpy as hp
+import matplotlib.pyplot as plt
 
 from utils.mrc import save_mrc
 from utils.rot_calc_error import compute_rot_error_single
 
-from dataset import StarfileDataLoader, RealDataset
+from dataset import RealDataset
 from torch.utils.data import DataLoader
 
 from pose_models import PoseModel
@@ -45,6 +47,7 @@ def parse_args(config):
     parser.add_argument('--batch_size', type=int, default=config.get('batch_size', 32))
     parser.add_argument('--r', type=float, default=config.get('r', 1.))
     parser.add_argument('--uninvert_data', action='store_true', default=config.get('uninvert_data', False))
+    parser.add_argument('--prior', type=str, choices=['true', 'false'], default=config.get('prior', 'false'))
 
     # amortized regime
     parser.add_argument('--epochs_amortized', type=int, default=config.get('epochs_amortized', 10))
@@ -63,6 +66,52 @@ def parse_args(config):
     
     args = parser.parse_args()
     return args
+
+
+def plot_orientation_distribution(rotmats, iteration, save_dir):
+    if isinstance(rotmats, torch.Tensor):
+        rotmats = rotmats.detach().cpu().numpy()
+    
+    print(f"Input rotation matrices shape: {rotmats.shape}")
+    assert len(rotmats.shape) == 3 and rotmats.shape[1:] == (3, 3), f"Expected shape (N, 3, 3), got {rotmats.shape}"
+    
+    view_dirs = rotmats[:, :, 2]  # Z-axis directions
+    print(f"Number of particles: {len(view_dirs)}")
+    
+    # Increase HEALPix resolution
+    nside = 8
+    npix = hp.nside2npix(nside)
+    
+    # Map view directions to HEALPix cells
+    pix = hp.vec2pix(nside, view_dirs[:, 0], view_dirs[:, 1], view_dirs[:, 2])
+    
+    # Count rotations in each cell
+    counts = np.array([np.sum(pix == i) for i in range(npix)])
+    
+    # Print some statistics to verify we're getting all rotations
+    print(f"Total number of rotations: {len(rotmats)}")
+    print(f"Number of non-zero cells: {np.sum(counts > 0)}")
+    print(f"Max rotations in a cell: {np.max(counts)}")
+    
+    # Create visualization
+    plt.figure(figsize=(15, 7))
+    
+    # Mollweide projection
+    plt.subplot(121)
+    hp.mollview(map=counts, title=f'Epoch {iteration}: Mollweide view', 
+                cmap='viridis', hold=True, flip='geo')
+    hp.graticule()
+    
+    # Cartesian projection
+    plt.subplot(122)
+    hp.cartview(map=counts, title=f'Epoch {iteration}: Cartesian view', 
+                cmap='viridis', hold=True, flip='geo')
+    hp.graticule()
+    
+    # Save plot
+    save_file = os.path.join(save_dir, f'dist_ep_{iteration}.png')
+    plt.savefig(save_file)
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -91,29 +140,43 @@ if __name__ == "__main__":
     if args.data == 'empiar10028':
         dataset = RealDataset(invert_data=~args.uninvert_data)
     else:
-        all_resolutions = {'hsp': 1.5, '80S': 3.77, 'spliceosome': 4.33, 'spike': 2.13}
+        all_resolutions = {'hsp': 1.5, '80S': 3.77, 'spliceosome': 4.33, 'spike': 2.13, 'J3365': 1.03 * 500 / 128}
         data = args.data
         resolution = all_resolutions[data]
         path_to_starfile = f'./synthetic_data/{data}'
-        strf = 'data.star'
-        dataset = StarfileDataLoader(img_sz, path_to_starfile, strf, invert_hand=False)
+        # strf = 'data.star'
+        # dataset = StarfileDataLoader(img_sz, path_to_starfile, strf, invert_hand=False)
+        dataset = RealDataset()
     dataloader = DataLoader(dataset, shuffle=True, batch_size=B, pin_memory=True,
                             num_workers=num_workers, drop_last=False)
     
+    hartley = args.space == 'hartley'
+    prior = args.prior == 'true'
+
     # build the model
     num_rotations = args.num_rotations
-    experimental = args.data == 'empiar10028'
     model = CryoSAPIENCE(
-                    ctf_params=dataset.ctf_params if not experimental else None, 
                     num_rotations=num_rotations, 
                     sidelen=img_sz, 
                     num_octaves=4,
                     hartley=hartley,
-                    experimental=experimental)
+                    experimental=True,
+                    use_prior=prior)
     resolution = model.ctf.apix
+    # import pdb; pdb.set_trace()
     model.cuda()
 
     epochs_amortized = args.epochs_amortized
+    experimental = True
+
+    # Create directories
+    reconst_volume_paths = os.path.join(save_path, 'reconst_volumes')
+    orientation_dist_paths = os.path.join(save_path, 'orientation_distributions')
+    ckpt_path = os.path.join(save_path, 'ckpt')
+    
+    for path in [reconst_volume_paths, orientation_dist_paths, ckpt_path]:
+        if not os.path.exists(path):
+            os.makedirs(path)
 
     # pose amortized inference and reconstruction
     if epochs_amortized > 0:
@@ -130,8 +193,11 @@ if __name__ == "__main__":
         decoder_optim = torch.optim.Adam(decoder_params)
 
         # encoder optimizer
-        encoder_params = [{'params': model.cnn_encoder.parameters(), 'lr': args.encoder_lr},
-                {'params': model.orientation_regressor.parameters(), 'lr': args.encoder_lr}]
+        encoder_params = [
+            {'params': model.cnn_encoder.parameters(), 'lr': args.encoder_lr},
+            {'params': model.known_angle_regressor.parameters(), 'lr': args.encoder_lr},
+            {'params': model.phi_regressor.parameters(), 'lr': args.encoder_lr}
+        ]
         encoder_optim = torch.optim.Adam(encoder_params)
 
         # amortized training
@@ -172,32 +238,29 @@ if __name__ == "__main__":
                 vol = model.pred_map.make_volume(r=r)
                 filename = os.path.join(reconst_volume_paths, f'ep_{iteration}.mrc')
                 save_mrc(filename, vol, voxel_size=resolution, header_origin=None)
-                if not experimental:
-                    # compute rotation error and save plots
-                    pred_rotmats = np.zeros((len(dataset), num_rotations, 3, 3))
-                    gt_rotmats = np.zeros((len(dataset), 3, 3))
-                    errors = np.zeros((len(dataset), num_rotations))
-                    for data in tqdm(dataloader):
-                        data_cuda = dict2cuda(data)
-                        idxs = data_cuda['idx'].detach().cpu().numpy()
-                        out_dict = model(data_cuda, r=r, amortized=True)
-                        fproj_input = data_cuda['fproj']
-                        fproj_pred = out_dict['pred_fproj']
-                        mask = out_dict['mask']
-                        head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
-                        errors[idxs] = head_loss.detach().cpu().numpy()
-                        pred_rotmats[idxs] = out_dict['rotmat'].detach().cpu().numpy()
-                        gt_rotmats[idxs] = data['rotmat'].detach().cpu().numpy()
-                    argmin = np.argmin(errors, axis=1)
-                    n = len(errors)
-                    selected_rotmats = pred_rotmats[np.arange(n), argmin]
-                    rot_errors_dict = compute_rot_error_single(selected_rotmats, gt_rotmats, n_samples=1000, error_type='mean')
-                    writer.add_histogram('full_rot_error', rot_errors_dict['full_rot_error'], iteration)
-                    writer.add_histogram('viewdir_error', rot_errors_dict['viewdir_error'], iteration)
-                    writer.add_scalar('mean_full_rot_error', rot_errors_dict['full_rot_error'].mean(), iteration)
-                    writer.add_scalar('mean_viewdir_error', rot_errors_dict['viewdir_error'].mean(), iteration)
-                    writer.add_scalar('median_full_rot_error', np.median(rot_errors_dict['full_rot_error']), iteration)
-                    writer.add_scalar('median_viewdir_error', np.median(rot_errors_dict['viewdir_error']), iteration)
+                
+                # Collect rotations for orientation distribution plotting
+                pred_rotmats = np.zeros((len(dataset), 3, 3))
+                for data in tqdm(dataloader):
+                    data_cuda = dict2cuda(data)
+                    idxs = data_cuda['idx'].detach().cpu().numpy()
+                    out_dict = model(data_cuda, r=r, amortized=True)
+                    fproj_input = data_cuda['fproj']
+                    fproj_pred = out_dict['pred_fproj']
+                    mask = out_dict['mask']
+                    
+                    batch_head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
+                    batch_min_head_idx = torch.argmin(batch_head_loss, dim=1).cpu().numpy()
+                    
+                    rotmats_batch = out_dict['rotmat'].detach().cpu().numpy()
+                    batch_size = len(idxs)
+                    rotmats_batch = rotmats_batch.reshape(batch_size, -1, 3, 3)
+                    
+                    for i, idx in enumerate(idxs):
+                        pred_rotmats[idx] = rotmats_batch[i, batch_min_head_idx[i]]
+                
+                # Plot orientation distribution
+                plot_orientation_distribution(pred_rotmats, iteration, orientation_dist_paths)
 
                 # save model and optimizer states
                 checkpoint = { 
@@ -205,8 +268,7 @@ if __name__ == "__main__":
                     'total_time': total_time,
                     'model': model.state_dict(),
                     'optimizer': decoder_optim.state_dict()}
-                torch.save(checkpoint, os.path.join(ckpt_path, f'ep_{iteration}.pth'))
-        init_epoch = epochs_amortized - 1
+                # torch.save(checkpoint, os.path.join(ckpt_path, f'ep_{iteration}.pth'))
     else:
         assert args.path_to_checkpoint != "none"
         assert args.epochs_unamortized > 0
@@ -215,6 +277,8 @@ if __name__ == "__main__":
         model.load_state_dict(checkpoint['model'])
         init_epoch = checkpoint['epoch']
         total_time = checkpoint['total_time']
+
+    init_epoch = epochs_amortized
 
     epochs_unamortized = args.epochs_unamortized
     if epochs_unamortized > 0:
@@ -232,32 +296,55 @@ if __name__ == "__main__":
 
         # select the best pose based on reconstruction loss
         rotmats = torch.zeros((len(dataset), 3, 3)).cuda()
-        gt_rotmats = np.zeros((len(dataset), 3, 3))
         model.eval()
         with torch.no_grad():
             for batch, data in tqdm(enumerate(dataloader), total=len(dataloader)):
                 data_cuda = dict2cuda(data)
-                idxs = data_cuda['idx'].detach().cpu().numpy()
+                idxs = data_cuda['idx']
                 out_dict = model(data_cuda, r=r, amortized=True)
                 fproj_input = data_cuda['fproj']
                 fproj_pred = out_dict['pred_fproj']
                 mask = out_dict['mask']
+                
+                # Compute losses and get best rotation indices
                 batch_head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
-                min_argmin = torch.min(batch_head_loss, 1)
-                batch_min_head_idx = min_argmin[1] # B
+                batch_min_head_idx = torch.argmin(batch_head_loss, dim=1)
+                
+                # Safely reshape and index the rotation matrices
                 pred_rotmats = out_dict['rotmat']
-                device = pred_rotmats.device
-                rotmats[idxs] = pred_rotmats[torch.arange(len(idxs)).to(device), batch_min_head_idx]
-                if not experimental:
-                    gt_rotmats[idxs] = data['rotmat'].detach().cpu().numpy()
+                B, M = batch_head_loss.shape  # B is batch size, M is number of rotations
+                pred_rotmats = pred_rotmats.view(B, M, 3, 3)
+                
+                # Use gather to safely select the best rotation for each sample
+                batch_indices = torch.arange(B, device=pred_rotmats.device)
+                selected_rotmats = pred_rotmats[batch_indices, batch_min_head_idx]
+                
+                # Safely assign to the output tensor
+                rotmats[idxs] = selected_rotmats
+
+
             if (not experimental) and (epochs_amortized == 0): # add initial results if not directly continuing from amortized training
-                rot_errors_dict = compute_rot_error_single(rotmats.detach().cpu().numpy(), gt_rotmats, n_samples=1000, error_type='mean')
-                writer.add_histogram('full_rot_error', rot_errors_dict['full_rot_error'], init_epoch)
-                writer.add_histogram('viewdir_error', rot_errors_dict['viewdir_error'], init_epoch)
-                writer.add_scalar('mean_full_rot_error', rot_errors_dict['full_rot_error'].mean(), init_epoch)
-                writer.add_scalar('mean_viewdir_error', rot_errors_dict['viewdir_error'].mean(), init_epoch)
-                writer.add_scalar('median_full_rot_error', np.median(rot_errors_dict['full_rot_error']), init_epoch)
-                writer.add_scalar('median_viewdir_error', np.median(rot_errors_dict['viewdir_error']), init_epoch)
+                # Collect rotations for plotting
+                pred_rotmats = np.zeros((len(dataset), 3, 3))
+                for data in tqdm(dataloader):
+                    data_cuda = dict2cuda(data)
+                    idxs = data_cuda['idx'].detach().cpu().numpy()
+                    out_dict = model(data_cuda, r=r, amortized=True)
+                    fproj_input = data_cuda['fproj']
+                    fproj_pred = out_dict['pred_fproj']
+                    mask = out_dict['mask']
+                    head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
+                    argmin = np.argmin(head_loss.detach().cpu().numpy(), axis=1)
+                    pred_rotmats[idxs] = out_dict['rotmat'].detach().cpu().numpy()[np.arange(len(idxs)), argmin]
+                
+                # Plot orientation distribution
+                plot_orientation_distribution(pred_rotmats, init_epoch, orientation_dist_paths)
+                
+                # Commented out GT-dependent code
+                # if not experimental:
+                #     gt_rotmats = ...  # Remove GT-related code
+                #     rot_errors_dict = compute_rot_error_single(...)
+                #     ...  # Remove metric logging
         model.train()
 
         # decoder optimizer
@@ -331,32 +418,40 @@ if __name__ == "__main__":
                 writer.add_scalar('time', total_time, iteration + 1 + init_epoch)
                 # generate volume
                 vol = model.pred_map.make_volume(r=r)
-                filename = os.path.join(reconst_volume_paths, f'ep_{iteration + init_epoch + 1}.mrc')
+                filename = os.path.join(reconst_volume_paths, f'ep_{iteration + init_epoch}.mrc')
                 save_mrc(filename, vol, voxel_size=resolution, header_origin=None)
-                if not experimental:
-                    pred_rotmats = np.zeros((len(dataset), 3, 3))
-                    gt_rotmats = np.zeros((len(dataset), 3, 3))
+                
+                # Collect rotations for plotting
+                pred_rotmats = np.zeros((len(dataset), 3, 3))
+                for data in tqdm(dataloader):
+                    data_cuda = dict2cuda(data)
+                    idxs = data_cuda['idx'].detach().cpu().numpy()
+                    out_dict = model(data_cuda, r=r, amortized=True)
+                    fproj_input = data_cuda['fproj']
+                    fproj_pred = out_dict['pred_fproj']
+                    mask = out_dict['mask']
                     
-                    for data in tqdm(dataloader):
-                        data_cuda = dict2cuda(data)
-                        idxs = data_cuda['idx'].detach().cpu().numpy()
-                        pred_rotmat = pose_model(idxs)
-                        out_dict = model(data_cuda, amortized=False, pred_rotmat=pred_rotmat, r=r)
-                        
-                        fproj_input = data_cuda['fproj']
-                        fproj_pred = out_dict['pred_fproj']
-                        mask = out_dict['mask']
-                        head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
-                        pred_rotmats[idxs] = pred_rotmat.detach().cpu().numpy()
-                        gt_rotmats[idxs] = data['rotmat'].detach().cpu().numpy()
-                            
-                    rot_errors_dict = compute_rot_error_single(pred_rotmats, gt_rotmats, n_samples=1000, error_type='mean')
-                    writer.add_histogram('full_rot_error', rot_errors_dict['full_rot_error'], init_epoch + iteration + 1)
-                    writer.add_histogram('viewdir_error', rot_errors_dict['viewdir_error'], init_epoch + iteration + 1)
-                    writer.add_scalar('mean_full_rot_error', rot_errors_dict['full_rot_error'].mean(), init_epoch + iteration + 1)
-                    writer.add_scalar('mean_viewdir_error', rot_errors_dict['viewdir_error'].mean(), init_epoch + iteration + 1)
-                    writer.add_scalar('median_full_rot_error', np.median(rot_errors_dict['full_rot_error']), init_epoch + iteration + 1)
-                    writer.add_scalar('median_viewdir_error', np.median(rot_errors_dict['viewdir_error']), init_epoch + iteration + 1)
+                    # Move computations to CPU and ensure proper shapes
+                    batch_head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
+                    batch_min_head_idx = torch.argmin(batch_head_loss, dim=1).cpu().numpy()
+                    
+                    # Move rotations to CPU and reshape
+                    rotmats_batch = out_dict['rotmat'].detach().cpu().numpy()
+                    batch_size = len(idxs)
+                    rotmats_batch = rotmats_batch.reshape(batch_size, -1, 3, 3)
+                    
+                    # Select best rotation for each sample
+                    for i, idx in enumerate(idxs):
+                        pred_rotmats[idx] = rotmats_batch[i, batch_min_head_idx[i]]
+                
+                # Plot orientation distribution
+                plot_orientation_distribution(pred_rotmats, iteration + init_epoch, orientation_dist_paths)
+                
+                # Commented out GT-dependent code
+                # if not experimental:
+                #     gt_rotmats = ...  # Remove GT-related code
+                #     rot_errors_dict = compute_rot_error_single(...)
+                #     ...  # Remove metric logging
 
                 # save model and optimizer states
                 checkpoint = { 
@@ -366,5 +461,5 @@ if __name__ == "__main__":
                     'pose_model': pose_model.state_dict(),
                     'pose_optimizer': pose_optim.state_dict(),
                     'decoder_optimizer': decoder_optim.state_dict()}
-                torch.save(checkpoint, os.path.join(ckpt_path, f'ep_{iteration + init_epoch + 1}.pth'))
+                # torch.save(checkpoint, os.path.join(ckpt_path, f'ep_{iteration + init_epoch + 1}.pth'))
     writer.close()

@@ -18,18 +18,51 @@ def print_ctf_params(params: np.ndarray) -> None:
 class ExperimentalCTF(nn.Module):
     def __init__(self):
         super(ExperimentalCTF, self).__init__()
-        cs_file_path = '/h/shekshaa/10028/cryosparc/J4_final_particles.cs'
-        metadata = np.load(cs_file_path)
-        self.D = metadata["blob/shape"][0][0]
-        self.apix = metadata['blob/psize_A'][0]
-        self.n_data = metadata['blob/psize_A'].shape[0]
-        kv = metadata['ctf/accel_kv'].copy()
-        w = metadata['ctf/amp_contrast'].copy()
-        dfu = metadata['ctf/df1_A'].copy()
-        dfv = metadata['ctf/df2_A'].copy()
-        dfang = metadata['ctf/df_angle_rad'].copy()
-        cs = metadata['ctf/cs_mm'].copy()
-        phase_shift = metadata['ctf/phase_shift_rad'].copy()
+        cs_file_path_1 = '/h/bizigerd/rotation_debugging/angle_estimated_equatorial_particles_rotation_matrix.cs'
+        cs_file_path_2 = '/h/bizigerd/rotation_debugging/angle_estimated_equatorial_particles_passthrough_rotation_matrix.cs'
+        metadata1 = np.load(cs_file_path_1)
+        metadata2 = np.load(cs_file_path_2)
+
+        paths = metadata1['blob/path'].copy()
+
+        # Decode paths
+        paths_decoded = np.array([p.decode('utf-8') if isinstance(p, bytes) else p for p in paths])
+
+        # Remove entries with unwanted substring in paths
+        unwanted_substring = 'FoilHole_11266022_Data_10173115_10173117_20231012_030400_EER_patch_aligned_doseweighted_particles.mrc'
+        indices_to_remove = np.where([unwanted_substring in path for path in paths_decoded])[0]
+        mask = np.ones(len(paths_decoded), dtype=bool)
+        mask[indices_to_remove] = False
+
+        self.original_D = metadata1["blob/shape"][0][0]
+        self.D = 128  # Downsampled image size
+        self.original_apix = metadata1['blob/psize_A'][0]
+        self.apix = self.original_apix * (self.original_D / self.D)  # Adjusted pixel size
+        self.n_data = metadata1['blob/psize_A'].shape[0]
+        kv = metadata2['ctf/accel_kv'].copy()
+        w = metadata2['ctf/amp_contrast'].copy()
+        dfu = metadata2['ctf/df1_A'].copy()
+        dfv = metadata2['ctf/df2_A'].copy()
+        dfang = metadata2['ctf/df_angle_rad'].copy()
+        cs = metadata2['ctf/cs_mm'].copy()
+        phase_shift = metadata2['ctf/phase_shift_rad'].copy()
+
+        # Remove the indexing with mask for scalar values
+        kv = kv[mask]
+        w = w[mask]
+        dfu = dfu[mask]
+        dfv = dfv[mask]
+        dfang = dfang[mask]
+        cs = cs[mask]
+        phase_shift = phase_shift[mask]
+
+        # # Calculate downsampling factor
+        # downsampling_factor = self.original_D / self.D
+
+        # # Adjust defocus values and pixel size
+        # dfu = dfu * downsampling_factor
+        # dfv = dfv * downsampling_factor
+        # cs = cs * downsampling_factor
 
         l = np.linspace(-0.5, 0.5, self.D, endpoint=False)
         x0, x1 = np.meshgrid(l, l)
