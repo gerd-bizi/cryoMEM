@@ -7,7 +7,6 @@ from utils.ctf import primal_to_fourier_2D
 from kornia.geometry.transform import translate
 import lie_tools
 import torchvision.transforms as transforms  # Import torchvision for resizing images
-import pandas as pd
 from torch.fft import fft2, ifft2, fftshift, ifftshift
 import math
 

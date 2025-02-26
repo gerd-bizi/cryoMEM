@@ -196,7 +196,8 @@ class AWGNGenerator(nn.Module):
 class DensityMapProjectionSimulator(Dataset):
     def __init__(self, 
                  mrc_filepath,
-                 projection_sz, 
+                 projection_sz,
+                 euler_angles=None,  # New parameter for custom angles
                  num_projs=None,
                  noise_generator=None, 
                  ctf_generator=None, 
@@ -204,50 +205,76 @@ class DensityMapProjectionSimulator(Dataset):
                  resolution=3.2, 
                  shift_generator=None):
         """
-        Initialization of a dataloader from a mrc, simulating a cryo-EM experiment.
+        Initialization of a dataloader from a mrc, simulating a cryo-EM experiment with custom angles.
 
         Parameters
         ----------
-        config: namespace
+        mrc_filepath : str
+            Path to the input density map
+        projection_sz : int
+            Size of the projections
+        euler_angles : numpy.ndarray, optional
+            Array of Euler angles in ZYZ convention (Nx3 array where N is num_projs)
+            Each row contains [rot, tilt, psi] in degrees
+            If None, random rotations will be generated
+        num_projs : int, optional
+            Number of projections to generate (only used if euler_angles is None)
         """
         self.projection_sz = projection_sz
         self.D = projection_sz + 1
         assert self.D % 2 == 1
-        self.num_projs = num_projs
+        
+        # Handle custom angles or random rotations
+        if euler_angles is not None:
+            self.num_projs = len(euler_angles)
+            # Convert degrees to radians and create rotation matrices
+            euler_angles_rad = np.radians(euler_angles)
+            self.rotmat = torch.zeros((self.num_projs, 3, 3))
+            for i in range(self.num_projs):
+                # Convert ZYZ Euler angles to rotation matrix
+                rot, tilt, psi = euler_angles_rad[i]
+                Rz1 = torch.tensor([[np.cos(rot), -np.sin(rot), 0],
+                                  [np.sin(rot), np.cos(rot), 0],
+                                  [0, 0, 1]])
+                Ry = torch.tensor([[np.cos(tilt), 0, np.sin(tilt)],
+                                 [0, 1, 0],
+                                 [-np.sin(tilt), 0, np.cos(tilt)]])
+                Rz2 = torch.tensor([[np.cos(psi), -np.sin(psi), 0],
+                                  [np.sin(psi), np.cos(psi), 0],
+                                  [0, 0, 1]])
+                self.rotmat[i] = Rz2 @ Ry @ Rz1
+        else:
+            self.num_projs = num_projs
+            self.rotmat = random_rotations(self.num_projs)
+
         self.noise_generator = noise_generator
         self.ctf_generator = ctf_generator
         self.shift_generator = shift_generator
 
-        ''' Read mrc file '''
+        # Read mrc file
         self.mrc_filepath = mrc_filepath
         with mrcfile.open(mrc_filepath) as mrc:
             mrc_data = np.copy(mrc.data)
             power_init = get_power(mrc_data)
             mrc_data = 2e4 * power_signal * mrc_data * mrc_data.shape[0] / (power_init * self.projection_sz)
-            # mrc_data = power_signal * mrc_data * mrc_data.shape[0] / (power_init * self.projection_sz[0])
-            # mrc_data = mrc_data * mrc_data.shape[0] / self.projection_sz[0]
             voxel_size = float(mrc.voxel_size.x)
-            if voxel_size < 1e-3:  # voxel_size = 0.
+            if voxel_size < 1e-3:
                 voxel_size = resolution
-                # voxel_size = 0.617
         self.mrc = mrc_data
         self.vol = torch.from_numpy(self.mrc).float()
-        fvol = expand_fourier3D(self.p2f_3D(self.vol))  # S+1, S+1, S+1
-        self.fvol = torch.view_as_real(fvol).permute(3, 0, 1, 2) # 2, S+1, S+1, S+1
+        fvol = expand_fourier3D(self.p2f_3D(self.vol))
+        self.fvol = torch.view_as_real(fvol).permute(3, 0, 1, 2)
 
-        ''' Planar coordinates '''
+        # Planar coordinates
         lincoords = np.linspace(-1, 1, self.D, endpoint=True)
         [X, Y] = np.meshgrid(lincoords, lincoords, indexing='ij')
         coords = np.stack([Y, X, np.zeros_like(X)], axis=-1)
         self.plane_coords = torch.tensor(coords).float().reshape(-1, 3)
 
-        ''' Rotations '''
-        self.rotmat = random_rotations(self.num_projs)
-
-        # Keep precomputed projections to avoid recomputing them
-        # and to get the same random realizations (for e.g. for noise)
+        # Precomputed projections cache
         self.precomputed_projs = [None]*self.num_projs
-        self.precomputed_fprojs = [None] * self.num_projs
+        self.precomputed_fprojs = [None]*self.num_projs
+
 
     @staticmethod
     def p2f_3D(r):
@@ -339,7 +366,73 @@ class DensityMapProjectionSimulator(Dataset):
             in_dict['shiftX'] = 0.
             in_dict['shiftY'] = 0.
 
-        return in_dict  
+        return in_dict
+    
+
+def create_uniform_angle_distribution(num_projs):
+    """
+    Creates a uniform distribution of Euler angles.
+    
+    Parameters
+    ----------
+    num_projs : int
+        Number of projections desired
+        
+    Returns
+    -------
+    numpy.ndarray
+        Array of shape (num_projs, 3) containing [rot, tilt, psi] angles in degrees
+    """
+    angles = np.zeros((num_projs, 3))
+    
+    # Generate uniform angles
+    golden_angle = np.pi * (3 - np.sqrt(5))
+    z_step = 2.0 / num_projs
+    
+    for i in range(num_projs):
+        z = ((i * z_step) - 1.0 + (z_step / 2.0))
+        r = np.sqrt(1.0 - z * z)
+        phi = ((i + 1) * golden_angle) % (2 * np.pi)
+        
+        # Convert to spherical coordinates
+        tilt = np.arccos(z)
+        rot = phi
+        psi = np.random.uniform(0, 360)  # Random in-plane rotation
+        
+        angles[i] = [np.degrees(rot), np.degrees(tilt), psi]
+    
+    return angles
+
+def create_preferred_angle_distribution(num_projs, preferred_tilt=90, tilt_std=10):
+    """
+    Creates a distribution of Euler angles with preferred orientations.
+    
+    Parameters
+    ----------
+    num_projs : int
+        Number of projections desired
+    preferred_tilt : float
+        Preferred tilt angle in degrees
+    tilt_std : float
+        Standard deviation of tilt angle in degrees
+        
+    Returns
+    -------
+    numpy.ndarray
+        Array of shape (num_projs, 3) containing [rot, tilt, psi] angles in degrees
+    """
+    angles = np.zeros((num_projs, 3))
+    
+    # Generate angles with preferred orientation
+    for i in range(num_projs):
+        rot = np.random.uniform(0, 360)
+        tilt = np.random.normal(preferred_tilt, tilt_std)
+        tilt = np.clip(tilt, 0, 180)  # Ensure valid tilt angle
+        psi = np.random.uniform(0, 360)
+        
+        angles[i] = [rot, tilt, psi]
+    
+    return angles
     
 
 def init_config(config):

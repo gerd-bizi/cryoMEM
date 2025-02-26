@@ -4,7 +4,7 @@ import numpy as np
 import pytorch3d.transforms
 from encoders import CNNEncoderVGG16, GaussianPyramid
 from utils.nets import FCBlock
-from decoders import Explicit3D
+from decoders import Explicit3D, ImplicitFourierVolume
 from utils.ctf import CTFRelion
 from utils.real_ctf import ExperimentalCTF
 
@@ -22,8 +22,11 @@ class CryoSAPIENCE(nn.Module):
         self.num_rotations = num_rotations
         self.sidelen = sidelen
 
-        # 3D map
+        # # 3D map
         self.pred_map = Explicit3D(downsampled_sz=sidelen, img_sz=sidelen, hartley=True)
+        # Implicit Fourier Volume
+        # params_implicit = {"type": "fouriernet", "force_symmetry": True}
+        # self.pred_map = ImplicitFourierVolume(img_sz=sidelen, params_implicit=params_implicit)
 
         # Gaussian Pyramid
         self.gaussian_filters = GaussianPyramid(
