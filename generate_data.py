@@ -11,7 +11,7 @@ import math
 import torch.nn.functional as F
 import mrcfile
 from torch.utils.data import Dataset, DataLoader
-from pytorch3d.transforms import random_rotations, matrix_to_euler_angles
+from pytorch3d.transforms import random_rotations, matrix_to_euler_angles, euler_angles_to_matrix
 from tqdm import tqdm
 import pandas as pd
 import starfile
@@ -197,7 +197,7 @@ class DensityMapProjectionSimulator(Dataset):
     def __init__(self, 
                  mrc_filepath,
                  projection_sz,
-                 euler_angles=None,  # New parameter for custom angles
+                 euler_angles=None,
                  num_projs=None,
                  noise_generator=None, 
                  ctf_generator=None, 
@@ -245,7 +245,11 @@ class DensityMapProjectionSimulator(Dataset):
                 self.rotmat[i] = Rz2 @ Ry @ Rz1
         else:
             self.num_projs = num_projs
-            self.rotmat = random_rotations(self.num_projs)
+            euler_angles = create_preferred_angle_distribution(self.num_projs, preferred_tilt=90, tilt_std=10)
+            # Convert the numpy array to a float32 tensor of shape (n, 3)
+            euler_tensor = torch.tensor(euler_angles, dtype=torch.float32)
+            # Convert directly to rotation matrices of shape (n, 3, 3)
+            self.rotmat = euler_angles_to_matrix(euler_tensor, "ZYZ")
 
         self.noise_generator = noise_generator
         self.ctf_generator = ctf_generator
@@ -425,10 +429,10 @@ def create_preferred_angle_distribution(num_projs, preferred_tilt=90, tilt_std=1
     
     # Generate angles with preferred orientation
     for i in range(num_projs):
-        rot = np.random.uniform(0, 360)
-        tilt = np.random.normal(preferred_tilt, tilt_std)
-        tilt = np.clip(tilt, 0, 180)  # Ensure valid tilt angle
-        psi = np.random.uniform(0, 360)
+        rot = np.radians(np.random.uniform(-180, 180))
+        tilt_delta = tilt_std * np.random.uniform(-1, 1)
+        tilt = np.radians(preferred_tilt + tilt_delta)  # Ensure valid tilt angle
+        psi = np.radians(np.random.uniform(-180, 180))
         
         angles[i] = [rot, tilt, psi]
     
@@ -444,7 +448,7 @@ def init_config(config):
                         help='The number of projections in a batch for training.')
     
     # Data Loading
-    parser.add_argument('--sidelen', type=int, default=config.get('sidelen', 128),
+    parser.add_argument('--sidelen', type=int, default=config.get('sidelen', 192),
                         help='The shape of the density map as determined by one side of the volume.')
     # parser.add_argument('--no_trans', type=int, default=0,
     #                     help='No translation in the dataset.')
@@ -464,9 +468,9 @@ def init_config(config):
                         help='Angle of astigmatism of the CTF used in the simulations (in radians).')
     parser.add_argument('--kV', type=float, default=config.get('kV', 300.0),
                         help='Electron beam energy used.')
-    parser.add_argument('--resolution', type=float, default=config.get('resolution', 1.0),
+    parser.add_argument('--resolution', type=float, default=config.get('resolution', 2.68),
                         help='Particle image resolution (in Angstrom).')
-    parser.add_argument('--cs', type=float, default=config.get('cs', 2.7),
+    parser.add_argument('--cs', type=float, default=config.get('cs', 5.0),
                         help='Spherical aberration.')
     parser.add_argument('--w', type=float, default=config.get('w', 0.1),
                         help='Amplitude contrast.')
@@ -482,7 +486,7 @@ def init_config(config):
                         help='Signal-noise ratio.')
     parser.add_argument('--power_signal', type=float, default=config.get('power_signal', 0.1),
                         help='Power of simulated signal (sum of squares).')
-    parser.add_argument('--num_projs', type=int, default=config.get('num_projs', 10000),
+    parser.add_argument('--num_projs', type=int, default=config.get('num_projs', 20),
                         help='The number of projections to simulate in the volume.')
     parser.add_argument('--output_dir', type=str, default=config.get('output_dir'),
                         help='Output directory for simulated starfiles.')
@@ -499,7 +503,7 @@ def get_filename(step, n_char=6):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', required=False, help='Path to config file.')
+    parser.add_argument('--config', required=False, default='configs/mrc2star_vatpase.yaml', help='Path to config file.')
 
     known_args, remaining_args = parser.parse_known_args()
 

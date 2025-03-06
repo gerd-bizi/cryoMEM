@@ -13,20 +13,24 @@ class CryoSAPIENCE(nn.Module):
     def __init__(self,  
                  num_rotations, 
                  ctf_params=None,
-                 sidelen=128, 
+                 sidelen=128,
+                 vol_rep='explicit',
                  num_octaves=4,
-                 hartley=False,
+                 hartley=True,
                  experimental=False,
                  use_prior=False):
         super(CryoSAPIENCE, self).__init__()
         self.num_rotations = num_rotations
         self.sidelen = sidelen
 
-        # # 3D map
-        self.pred_map = Explicit3D(downsampled_sz=sidelen, img_sz=sidelen, hartley=True)
-        # Implicit Fourier Volume
-        # params_implicit = {"type": "fouriernet", "force_symmetry": True}
-        # self.pred_map = ImplicitFourierVolume(img_sz=sidelen, params_implicit=params_implicit)
+        vol_rep = 'implicit'
+
+        if vol_rep == 'explicit':
+            self.pred_map = Explicit3D(downsampled_sz=sidelen, img_sz=sidelen, hartley=hartley)
+        else:
+            # Implicit Fourier Volume
+            params_implicit = {"type": "fouriernet", "force_symmetry": False}
+            self.pred_map = ImplicitFourierVolume(img_sz=sidelen, params_implicit=params_implicit)
 
         # Gaussian Pyramid
         self.gaussian_filters = GaussianPyramid(
@@ -97,7 +101,7 @@ class CryoSAPIENCE(nn.Module):
                                 flip_images=False)
         self.experimental = experimental
     
-    def forward_amortized(self, in_dict, r=None):
+    def forward_amortized(self, in_dict, r):
         # # encoder
         # proj = in_dict['proj_input']
         # proj = self.gaussian_filters(proj)
@@ -149,18 +153,29 @@ class CryoSAPIENCE(nn.Module):
         #Swap the order of the angles to be ZYZ
         # gt_angles = gt_angles[:, [2, 1, 0]]
 
+        # Zero out deltas, and randomize phi, expect rotationally averaged
+
         # Construct final euler angles for each hypothesis
         B = latent_code.shape[0]
-        pred_angles = torch.zeros(B, self.num_rotations, 3, device=latent_code.device)
-        pred_angles[:, :, 0] = gt_angles[:, 0:1].expand(-1, self.num_rotations) + delta_angles[:, 0:1].expand(-1, self.num_rotations)  # psi (second Z rotation)
-        pred_angles[:, :, 1] = gt_angles[:, 1:2].expand(-1, self.num_rotations) + delta_angles[:, 1:2].expand(-1, self.num_rotations)  # theta (Y rotation)
-        pred_angles[:, :, 2] = all_phi.squeeze(-1)  # phi (first Z rotation)
+        # pred_angles = torch.zeros(B, self.num_rotations, 3, device=latent_code.device)
+        # pred_angles[:, :, 0] = gt_angles[:, 0:1].expand(-1, self.num_rotations) + delta_angles[:, 0:1].expand(-1, self.num_rotations)  # psi (second Z rotation)
+        # pred_angles[:, :, 1] = gt_angles[:, 1:2].expand(-1, self.num_rotations) + delta_angles[:, 1:2].expand(-1, self.num_rotations)  # theta (Y rotation)
+        # pred_angles[:, :, 2] = all_phi.squeeze(-1)  # phi (first Z rotation)
 
+        pred_angles = torch.zeros(B, self.num_rotations, 3, device=latent_code.device)
+        pred_angles[:, :, 0] = gt_angles[:, 0:1].expand(-1, self.num_rotations)  # psi (second Z rotation)
+        pred_angles[:, :, 1] = gt_angles[:, 1:2].expand(-1, self.num_rotations)  # theta (Y rotation)
+        pred_angles[:, :, 2] = gt_angles[:, 2:3].expand(-1, self.num_rotations)  # phi (first Z rotation)
+        
         
         # Convert to rotation matrices
         pred_rotmat = pytorch3d.transforms.euler_angles_to_matrix(
             pred_angles.view(-1, 3), 'ZYZ'
         ).view(B, self.num_rotations, 3, 3)
+
+
+        # Remove pose inference altogether, try using explicit again
+        # Expected: rotationally averaged
         
         # Reshape for decoder
         pred_rotmat = pred_rotmat.view(-1, 3, 3)

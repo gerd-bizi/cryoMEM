@@ -9,143 +9,194 @@ import lie_tools
 import torchvision.transforms as transforms  # Import torchvision for resizing images
 from torch.fft import fft2, ifft2, fftshift, ifftshift
 import math
-
-# def euler_angles2matrix(alpha, beta, gamma):
-#     """
-#     Converts euler angles in RELION convention to rotation matrix.
-
-#     Parameters
-#     ----------
-#     alpha: float / np.array
-#     beta: float / np.array
-#     gamma: float / np.array
-
-#     Returns
-#     -------
-#     A: np.array (3, 3)
-#     """
-#     # For RELION Euler angle convention
-#     ca = np.cos(alpha)
-#     cb = np.cos(beta)
-#     cg = np.cos(gamma)
-#     sa = np.sin(alpha)
-#     sb = np.sin(beta)
-#     sg = np.sin(gamma)
-#     cc = cb * ca
-#     cs = cb * sa
-#     sc = sb * ca
-#     ss = sb * sa
-
-#     A = np.zeros((3, 3))
-#     A[0, 0] = cg * cc - sg * sa
-#     A[0, 1] = -cg * cs - sg * ca
-#     A[0, 2] = cg * sb
-#     A[1, 0] = sg * cc + cg * sa
-#     A[1, 1] = -sg * cs + cg * ca
-#     A[1, 2] = sg * sb
-#     A[2, 0] = -sc
-#     A[2, 1] = ss
-#     A[2, 2] = cb
-#     return A
+import starfile
 
 
-# class StarfileDataLoader(Dataset):
-#     def __init__(self, side_len, path_to_starfile, 
-#                  input_starfile, invert_hand, max_n_projs=None):
-#         """
-#         Initialization of a dataloader from starfile format.
+def fourier_crop(img_tensor, crop_size=128):
+        """
+        Crops an image in the Fourier domain to 128x128.
 
-#         Parameters
-#         ----------
-#         config: namespace
-#         """
-#         super(StarfileDataLoader, self).__init__()
-
-
-#         self.path_to_starfile = path_to_starfile
-#         self.starfile = input_starfile
-#         self.df = starfile.open(os.path.join(self.path_to_starfile, self.starfile))
-#         self.sidelen_input = side_len
-#         self.vol_sidelen = side_len
-
-#         self.invert_hand = invert_hand
-
-#         idx_max = len(self.df['particles']) - 1
-#         if max_n_projs is not None:
-#             self.num_projs = max_n_projs
-#         else:
-#             self.num_projs = idx_max + 1
-#         self.idx_min = 0
-
-#         self.ctf_params = {
-#             "ctf_size": self.vol_sidelen,
-#             "kV": self.df['optics']['rlnVoltage'][0],
-#             "spherical_abberation": self.df['optics']['rlnSphericalAberration'][0],
-#             "amplitude_contrast": self.df['optics']['rlnAmplitudeContrast'][0],
-#             "resolution": self.df['optics']['rlnImagePixelSize'][0] * self.sidelen_input / self.vol_sidelen,
-#             "n_particles": idx_max + 1
-#         }
-
-
-#     def __len__(self):
-#         return self.num_projs
-
-#     def __getitem__(self, idx):
-#         """
-#         Initialization of a dataloader from starfile format.
-
-#         Parameters
-#         ----------
-#         idx: int
-
-#         Returns
-#         -------
-#         in_dict: Dictionary
-#         """
-#         particle = self.df['particles'].iloc[idx + self.idx_min]
-#         try:
-#             # Load particle image from mrcs file
-#             imgname_raw = particle['rlnImageName']
-#             imgnamedf = particle['rlnImageName'].split('@')
-#             mrc_path = os.path.join(self.path_to_starfile, imgnamedf[1])
-#             pidx = int(imgnamedf[0]) - 1
-#             with mrcfile.mmap(mrc_path, mode='r', permissive=True) as mrc:
-#                 proj = torch.from_numpy(mrc.data[pidx].copy()).float()
-#             proj = proj[None, :, :]  # add a dummy channel (for consistency w/ img fmt)
-
-#         except Exception:
-#             print(f"WARNING: Particle image {particle['rlnImageName']} invalid!\nSetting to zeros.")
-#             proj = torch.zeros(self.vol_sidelen, self.vol_sidelen)
-#             proj = proj[None, :, :]
+        Parameters:
+        -----------
+        img_tensor: torch.Tensor
+            The input image in spatial domain (1, H, W).
         
-# I
-#         # Read "GT" orientations
-#         rotmat = torch.from_numpy(
-#             euler_angles2matrix(
-#                 np.radians(-particle['rlnAngleRot']),
-#                 np.radians(particle['rlnAngleTilt'])*(-1 if self.invert_hand else 1),
-#                 np.radians(-particle['rlnAnglePsi'])
-#             )
-#         ).float()
-
-#         shiftX = torch.from_numpy(np.array(particle['rlnOriginXAngst']))
-#         shiftY = torch.from_numpy(np.array(particle['rlnOriginYAngst']))
-#         shifts = torch.stack([shiftX, shiftY], dim=-1)
-
-#         fproj = primal_to_fourier_2D(proj)
+        Returns:
+        --------
+        cropped_img: torch.Tensor
+            The cropped image in the spatial domain (1, 128, 128).
+        """
+        # Step 1: Perform 2D Fourier transform
+        fft_img = fftshift(fft2(img_tensor))
         
-#         in_dict = {'proj_input': proj,
-#                    'fproj': fproj,
-#                    'rotmat': rotmat,
-#                    'shifts': shifts,
-#                    'idx': torch.tensor(idx, dtype=torch.long),
-#                    }
+        # Step 2: Crop the Fourier domain
+        _, h, w = fft_img.shape
+        crop_h, crop_w = crop_size, crop_size
+        start_h, start_w = (h - crop_h) // 2, (w - crop_w) // 2
+        cropped_fft = fft_img[:, start_h:start_h + crop_h, start_w:start_w + crop_w]
 
-#         if self.ctf_params is not None:
-#             in_dict['defocusU'] = torch.from_numpy(np.array(particle['rlnDefocusU'] / 1e4, ndmin=2)).float()
-#             in_dict['defocusV'] = torch.from_numpy(np.array(particle['rlnDefocusV'] / 1e4, ndmin=2)).float()
-#             in_dict['angleAstigmatism'] = torch.from_numpy(np.radians(np.array(particle['rlnDefocusAngle'], ndmin=2))).float()
-#         return in_dict
+        # Step 3: Inverse FFT to bring back to spatial domain
+        cropped_img = ifft2(ifftshift(cropped_fft)).real
+        
+        return cropped_img
+    
+def create_radial_hann(size):
+    """
+    Creates a radial Hann window.
+    
+    Parameters:
+    -----------
+    size: int
+        Size of the window (assumes square image)
+        
+    Returns:
+    --------
+    window: torch.Tensor
+        2D radial Hann window
+    """
+    center = size // 2
+    Y, X = torch.meshgrid(torch.arange(size), torch.arange(size), indexing='ij')
+    R = torch.sqrt((X - center) ** 2 + (Y - center) ** 2)
+    R = R / R.max()  # Normalize distances
+    window = 0.5 * (1 + torch.cos(math.pi * R))
+    return window
+
+def euler_angles2matrix(alpha, beta, gamma):
+    """
+    Converts euler angles in RELION convention to rotation matrix.
+
+    Parameters
+    ----------
+    alpha: float / np.array
+    beta: float / np.array
+    gamma: float / np.array
+
+    Returns
+    -------
+    A: np.array (3, 3)
+    """
+    # For RELION Euler angle convention
+    ca = np.cos(alpha)
+    cb = np.cos(beta)
+    cg = np.cos(gamma)
+    sa = np.sin(alpha)
+    sb = np.sin(beta)
+    sg = np.sin(gamma)
+    cc = cb * ca
+    cs = cb * sa
+    sc = sb * ca
+    ss = sb * sa
+
+    A = np.zeros((3, 3))
+    A[0, 0] = cg * cc - sg * sa
+    A[0, 1] = -cg * cs - sg * ca
+    A[0, 2] = cg * sb
+    A[1, 0] = sg * cc + cg * sa
+    A[1, 1] = -sg * cs + cg * ca
+    A[1, 2] = sg * sb
+    A[2, 0] = -sc
+    A[2, 1] = ss
+    A[2, 2] = cb
+    return A
+
+
+class StarfileDataLoader(Dataset):
+    def __init__(self, side_len, invert_hand,
+                 starfile_path='/datasets/empiar/vatpase_synth/data.star', max_n_projs=None):
+        """
+        Initialization of a dataloader from starfile format.
+
+        Parameters
+        ----------
+        config: namespace
+        """
+        super(StarfileDataLoader, self).__init__()
+
+
+        self.starfile_path = starfile_path
+        self.df = starfile.open(self.starfile_path)
+        self.sidelen_input = side_len
+        self.vol_sidelen = side_len
+
+        self.invert_hand = invert_hand
+
+        idx_max = len(self.df['particles']) - 1
+        if max_n_projs is not None:
+            self.num_projs = max_n_projs
+        else:
+            self.num_projs = idx_max + 1
+        self.idx_min = 0
+
+        self.ctf_params = {
+            "ctf_size": self.vol_sidelen,
+            "kV": self.df['optics']['rlnVoltage'][0],
+            "spherical_abberation": self.df['optics']['rlnSphericalAberration'][0],
+            "amplitude_contrast": self.df['optics']['rlnAmplitudeContrast'][0],
+            "resolution": self.df['optics']['rlnImagePixelSize'][0] * self.sidelen_input / self.vol_sidelen,
+            "n_particles": idx_max + 1
+        }
+
+
+    def __len__(self):
+        return self.num_projs
+
+    def __getitem__(self, idx):
+        """
+        Initialization of a dataloader from starfile format.
+
+        Parameters
+        ----------
+        idx: int
+
+        Returns
+        -------
+        in_dict: Dictionary
+        """
+        particle = self.df['particles'].iloc[idx + self.idx_min]
+        try:
+            # Load particle image from mrcs file
+            imgname_raw = particle['rlnImageName']
+            imgnamedf = particle['rlnImageName'].split('@')
+            mrc_path = os.path.join(self.path_to_starfile, imgnamedf[1])
+            pidx = int(imgnamedf[0]) - 1
+            with mrcfile.mmap(mrc_path, mode='r', permissive=True) as mrc:
+                proj = torch.from_numpy(mrc.data[pidx].copy()).float()
+            proj = proj[None, :, :]  # add a dummy channel (for consistency w/ img fmt)
+
+        except Exception:
+            print(f"WARNING: Particle image {particle['rlnImageName']} invalid!\nSetting to zeros.")
+            proj = torch.zeros(self.vol_sidelen, self.vol_sidelen)
+            proj = proj[None, :, :]
+        
+
+        # Read "GT" orientations
+        rotmat = torch.from_numpy(
+            euler_angles2matrix(
+                np.radians(-particle['rlnAngleRot']),
+                np.radians(particle['rlnAngleTilt'])*(-1 if self.invert_hand else 1),
+                np.radians(-particle['rlnAnglePsi'])
+            )
+        ).float()
+
+        shiftX = torch.from_numpy(np.array(particle['rlnOriginXAngst']))
+        shiftY = torch.from_numpy(np.array(particle['rlnOriginYAngst']))
+        shifts = torch.stack([shiftX, shiftY], dim=-1)
+
+        fproj = primal_to_fourier_2D(proj)
+        
+        in_dict = {'proj_input': proj,
+                   'fproj': fproj,
+                   'rots': rotmat,
+                   'gt_rots': rotmat,
+                   'shifts': shifts,
+                   'idx': torch.tensor(idx, dtype=torch.long),
+                   }
+
+        if self.ctf_params is not None:
+            in_dict['defocusU'] = torch.from_numpy(np.array(particle['rlnDefocusU'] / 1e4, ndmin=2)).float()
+            in_dict['defocusV'] = torch.from_numpy(np.array(particle['rlnDefocusV'] / 1e4, ndmin=2)).float()
+            in_dict['angleAstigmatism'] = torch.from_numpy(np.radians(np.array(particle['rlnDefocusAngle'], ndmin=2))).float()
+        return in_dict
     
 
 # class RealDataset(Dataset):
@@ -267,55 +318,6 @@ class RealDataset(Dataset):
 
     def __len__(self):
         return self.n_data
-    
-    def fourier_crop(self, img_tensor):
-        """
-        Crops an image in the Fourier domain to 128x128.
-
-        Parameters:
-        -----------
-        img_tensor: torch.Tensor
-            The input image in spatial domain (1, H, W).
-        
-        Returns:
-        --------
-        cropped_img: torch.Tensor
-            The cropped image in the spatial domain (1, 128, 128).
-        """
-        # Step 1: Perform 2D Fourier transform
-        fft_img = fftshift(fft2(img_tensor))
-        
-        # Step 2: Crop the Fourier domain
-        _, h, w = fft_img.shape
-        crop_h, crop_w = 128, 128
-        start_h, start_w = (h - crop_h) // 2, (w - crop_w) // 2
-        cropped_fft = fft_img[:, start_h:start_h + crop_h, start_w:start_w + crop_w]
-
-        # Step 3: Inverse FFT to bring back to spatial domain
-        cropped_img = ifft2(ifftshift(cropped_fft)).real
-        
-        return cropped_img
-    
-    def create_radial_hann(self, size):
-        """
-        Creates a radial Hann window.
-        
-        Parameters:
-        -----------
-        size: int
-            Size of the window (assumes square image)
-            
-        Returns:
-        --------
-        window: torch.Tensor
-            2D radial Hann window
-        """
-        center = size // 2
-        Y, X = torch.meshgrid(torch.arange(size), torch.arange(size), indexing='ij')
-        R = torch.sqrt((X - center) ** 2 + (Y - center) ** 2)
-        R = R / R.max()  # Normalize distances
-        window = 0.5 * (1 + torch.cos(math.pi * R))
-        return window
 
     def __getitem__(self, i):
         idx = self.ids[i]
@@ -340,7 +342,7 @@ class RealDataset(Dataset):
             old_D = proj.shape[-1]
             new_D = 128
             if old_D > new_D:
-                proj = self.fourier_crop(torch.from_numpy(proj).float())
+                proj = fourier_crop(torch.from_numpy(proj).float())
             else:
                 proj = torch.from_numpy(proj).float()
             

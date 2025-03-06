@@ -339,7 +339,7 @@ class Symmetrizer():
     
 
 class FourierNet(nn.Module):
-    def __init__(self, channels=1, layers=[3, 2], params=[256, 256], nl=['sin', 'sin'], w0=[20, 30],
+    def __init__(self, channels=1, layers=[3, 2], params=[256, 256], nl=['sin', 'sin'], w0=[40, 30],
                  force_symmetry=False):
         """
         Initialization of a FourierNet.
