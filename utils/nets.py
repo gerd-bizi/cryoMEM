@@ -167,7 +167,7 @@ def layer_factory(layer_type):
 class FCBlock(nn.Module):
     def __init__(self, in_features, features, out_features,
                  nonlinearity='relu', last_nonlinearity=None,
-                 batch_norm=False, group_norm=0):
+                 batch_norm=False, group_norm=0, zero_init=False):
         """
         Initialization of a fully connected network.
 
@@ -209,6 +209,9 @@ class FCBlock(nn.Module):
                 self.net.append(nl)
             else:
                 # init_weights_normal(layer)
+                if zero_init:
+                    # set the weights of the this layer to 1e-4
+                    layer.weight.data.fill_(1e-4)
                 self.net.append(layer)
             if hidden:
                 if group_norm > 0:

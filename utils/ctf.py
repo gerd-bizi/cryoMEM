@@ -103,6 +103,7 @@ class CTFRelion(CTFBase):
 
         self.size = size  # in pixel
         self.resolution = resolution  # in angstrom
+        self.apix = resolution
         self.kV = kV  # in kilovolt
 
         self.valueNyquist = valueNyquist

@@ -8,6 +8,38 @@ from decoders import Explicit3D, ImplicitFourierVolume
 from utils.ctf import CTFRelion
 from utils.real_ctf import ExperimentalCTF
 
+def angular_difference(ang1, ang2, angle_type):
+    """
+    Compute the minimum angular difference accounting for periodicity and angle range.
+    
+    Parameters:
+    -----------
+    ang1, ang2 : torch.Tensor
+        Angles to compute difference between
+    angle_type : str
+        'psi', 'theta', or 'phi' to indicate which Euler angle is being compared
+        
+    Returns:
+    --------
+    diff : torch.Tensor
+        The smallest angular difference respecting the periodic boundaries
+    """
+    if angle_type in ['in_mem', 'in_plane']:  # For angles with range [-π, π]
+        diff = (ang1 - ang2 + np.pi) % (2*np.pi) - np.pi
+    elif angle_type == 'tilt':  # For angles with range [0, π]
+        # For theta, we need special handling since it's in [0, π]
+        # First compute raw difference
+        raw_diff = ang1 - ang2
+        
+        # For theta, we need to consider the spherical geometry
+        # If both angles are close to 0 or π, the direct difference is correct
+        # Otherwise, we need to account for the non-periodic nature of theta
+        diff = raw_diff
+    else:
+        raise ValueError(f"Unknown angle_type: {angle_type}")
+        
+    return diff
+
 
 class CryoSAPIENCE(nn.Module):
     def __init__(self,  
@@ -17,13 +49,15 @@ class CryoSAPIENCE(nn.Module):
                  vol_rep='explicit',
                  num_octaves=4,
                  hartley=True,
-                 experimental=False,
-                 use_prior=False):
+                 data_type='real',
+                 amortized_method='split_reg'):
         super(CryoSAPIENCE, self).__init__()
         self.num_rotations = num_rotations
         self.sidelen = sidelen
-
-        vol_rep = 'implicit'
+        self.vol_rep = vol_rep
+        self.hartley = hartley
+        self.data_type = data_type
+        self.amortized_method = amortized_method
 
         if vol_rep == 'explicit':
             self.pred_map = Explicit3D(downsampled_sz=sidelen, img_sz=sidelen, hartley=hartley)
@@ -47,45 +81,60 @@ class CryoSAPIENCE(nn.Module):
         cnn_encoder_out_shape = self.cnn_encoder.get_out_shape(sidelen, sidelen)
         latent_code_size = torch.prod(torch.tensor(cnn_encoder_out_shape))
 
-        # Orientation regressor
-        # self.latent_to_rot3d_fn = pytorch3d.transforms.rotation_6d_to_matrix
-        # self.orientation_dims = 6
-        # self.orientation_regressor = nn.ModuleList()
-        # for _ in range(self.num_rotations):
-        #     # We split the regressor in 2 to have access to the latent code
-        #     self.orientation_regressor.append(FCBlock(
-        #         in_features=latent_code_size,
-        #         out_features=self.orientation_dims,
-        #         features=[512, 256],
-        #         nonlinearity='relu',
-        #         last_nonlinearity=None,
-        #         batch_norm=True,
-        #         group_norm=0)
-        #     )
+        if amortized_method == 's2s2' or amortized_method == 'penalty_s2s2':
+            # Orientation regressor
+            self.latent_to_rot3d_fn = pytorch3d.transforms.rotation_6d_to_matrix
+            self.orientation_dims = 6
+            self.orientation_regressor = nn.ModuleList()
+            for _ in range(self.num_rotations):
+                # We split the regressor in 2 to have access to the latent code
+                self.orientation_regressor.append(FCBlock(
+                    in_features=latent_code_size,
+                    out_features=self.orientation_dims,
+                    features=[512, 256],
+                    nonlinearity='relu',
+                    last_nonlinearity=None,
+                    batch_norm=True,
+                    group_norm=0)
+                )
+        elif amortized_method == 'euler' or amortized_method == 'penalty_euler':
+            # Euler regressor
+            self.orientation_dims = 3
+            self.euler_regressor = nn.ModuleList([
+                FCBlock(
+                    in_features=latent_code_size,
+                    out_features=self.orientation_dims,
+                    features=[256, 128],
+                    nonlinearity='relu',
+                    last_nonlinearity=None,
+                    batch_norm=True
+                ) for _ in range(self.num_rotations)
+            ])
 
-        self.known_angle_regressor = FCBlock(
-            in_features=latent_code_size,
-            out_features=2,  # delta_theta, delta_psi
-            features=[256, 128],
-            nonlinearity='relu',
-            last_nonlinearity='tanh',  # outputs in [-1, 1]
-            batch_norm=True
-        )
-        self.angle_scale_factor = 1/18 * np.pi  # Store as a separate parameter
-
-        self.phi_regressor = nn.ModuleList([
-            FCBlock(
+        elif amortized_method == 'split_reg' or amortized_method == 'none':
+            self.known_angle_regressor = FCBlock(
                 in_features=latent_code_size,
-                out_features=1,  # phi prediction
+                out_features=2,  # delta_theta, delta_psi
                 features=[256, 128],
                 nonlinearity='relu',
-                last_nonlinearity=None,
+                last_nonlinearity='tanh',  # outputs in [-1, 1]
                 batch_norm=True
-            ) for _ in range(self.num_rotations)
-        ])
+            )
+            self.angle_scale_factor = 1/18 * np.pi
+
+            self.phi_regressor = nn.ModuleList([
+                FCBlock(
+                    in_features=latent_code_size,
+                    out_features=1,  # phi prediction
+                    features=[256, 128],
+                    nonlinearity='relu',
+                    last_nonlinearity=None,
+                    batch_norm=True
+                ) for _ in range(self.num_rotations)
+            ])
 
 
-        if experimental:
+        if data_type == 'real':
             self.ctf = ExperimentalCTF()
         else:
             assert ctf_params is not None
@@ -99,86 +148,179 @@ class CryoSAPIENCE(nn.Module):
                                 num_particles=ctf_params['n_particles'], 
                                 precompute=0,
                                 flip_images=False)
-        self.experimental = experimental
-    
+        self.experimental = (data_type == 'real')
+
     def forward_amortized(self, in_dict, r):
-        # # encoder
-        # proj = in_dict['proj_input']
-        # proj = self.gaussian_filters(proj)
-        # latent_code = torch.flatten(self.cnn_encoder(proj), start_dim=1)
-        # all_latent_code_prerot = []
-        # for orientation_regressor in self.orientation_regressor:
-        #     latent_code_prerot = orientation_regressor(latent_code)
-        #     all_latent_code_prerot.append(latent_code_prerot)
-        # all_latent_code_prerot = torch.stack(all_latent_code_prerot, dim=1)
-        # pred_rotmat = self.latent_to_rot3d_fn(all_latent_code_prerot)
-        # pred_rotmat = pred_rotmat.view(-1, 3, 3)
+        batch_size = in_dict['proj_input'].shape[0]
+        if self.amortized_method == 's2s2' or self.amortized_method == 'penalty_s2s2':
+            # encoder
+            proj = in_dict['proj_input']
+            proj = self.gaussian_filters(proj)
+            latent_code = torch.flatten(self.cnn_encoder(proj), start_dim=1)
+            all_latent_code_prerot = []
+            for orientation_regressor in self.orientation_regressor:
+                latent_code_prerot = orientation_regressor(latent_code)
+                all_latent_code_prerot.append(latent_code_prerot)
+            all_latent_code_prerot = torch.stack(all_latent_code_prerot, dim=1)
+            pred_rotmat = self.latent_to_rot3d_fn(all_latent_code_prerot)
+            pred_rotmat = pred_rotmat.view(-1, 3, 3)
 
-        # # decoder
-        # out_dict = self.pred_map(pred_rotmat, r=r)
-        # pred_fproj_prectf = out_dict['pred_fproj_prectf']
-        # mask = out_dict['mask']
-        # B, _, H, W = pred_fproj_prectf.shape
-        # pred_fproj_prectf = pred_fproj_prectf.view(B // self.num_rotations, self.num_rotations, H, W)
-        # pred_rotmat = pred_rotmat.view(B // self.num_rotations, self.num_rotations, 3, 3)
+            pred_euler_angles = pytorch3d.transforms.matrix_to_euler_angles(pred_rotmat, 'ZYZ')
+            pred_euler_angles = pred_euler_angles.view(batch_size, self.num_rotations, 3)
 
-        # # gt_rotmat = in_dict['gt_rots']
+            pred_euler_angles[:, :, 0] = (pred_euler_angles[:, :, 0] + np.pi) % (2 * np.pi) - np.pi
+            pred_euler_angles[:, :, 1] = (pred_euler_angles[:, :, 1]) % np.pi
+            pred_euler_angles[:, :, 2] = (pred_euler_angles[:, :, 2] + np.pi) % (2 * np.pi) - np.pi
 
-        # # predicted_euler_angles = pytorch3d.transforms.matrix_to_euler_angles(pred_rotmat, 'ZYZ')
+            # inital comparison
+            init_angles = pytorch3d.transforms.matrix_to_euler_angles(in_dict['init_rots'], 'ZYZ')  # [B, 3]
 
-        # # gt_euler_angles = pytorch3d.transforms.matrix_to_euler_angles(gt_rotmat, 'ZYZ')
+            
 
-        # # predicted_euler_angles[0] = gt_euler_angles[0]
-        # # predicted_euler_angles[1] = gt_euler_angles[1]
+            # Reshape predicted Euler angles to shape [B, num_rotations, 3]
+            init_psi_diff = pred_euler_angles[:, :, 0] - init_angles[:, 0].unsqueeze(1)
+            init_theta_diff = pred_euler_angles[:, :, 1] - init_angles[:, 1].unsqueeze(1)
+            init_phi_diff = pred_euler_angles[:, :, 2] - init_angles[:, 2].unsqueeze(1)
 
-        # # pred_rotmat = pytorch3d.transforms.euler_angles_to_matrix(predicted_euler_angles, 'ZYZ')
+            # gt comparison
+            gt_angles = pytorch3d.transforms.matrix_to_euler_angles(in_dict['gt_rots'], 'ZYZ')  # [B, 3]
+            # Reshape predicted Euler angles to shape [B, num_rotations, 3]
+            gt_psi_diff = pred_euler_angles[:, :, 0] - gt_angles[:, 0].unsqueeze(1)
+            gt_theta_diff = pred_euler_angles[:, :, 1] - gt_angles[:, 1].unsqueeze(1)
+            gt_phi_diff = pred_euler_angles[:, :, 2] - gt_angles[:, 2].unsqueeze(1)
 
-        proj = in_dict['proj_input']
-        proj = self.gaussian_filters(proj)
-        latent_code = torch.flatten(self.cnn_encoder(proj), start_dim=1)
-        
-        # Get delta_theta and delta_psi predictions and scale them
-        delta_angles = self.known_angle_regressor(latent_code) * self.angle_scale_factor
-        
-        # Get multiple phi predictions
-        all_phi = []
-        for phi_reg in self.phi_regressor:
-            phi = phi_reg(latent_code)  # Shape: [B, 1]
-            all_phi.append(phi)
-        all_phi = torch.stack(all_phi, dim=1)  # Shape: [B, num_rotations, 1]
-        
-        # Combine with known angles from input
-        gt_angles = pytorch3d.transforms.matrix_to_euler_angles(in_dict['gt_rots'], 'ZYZ')  # [B, 3]
+        elif self.amortized_method == 'euler' or self.amortized_method == 'penalty_euler':
+            # Process input projection through Gaussian filters and encoder.
+            proj = in_dict['proj_input']
+            proj = self.gaussian_filters(proj)
+            latent_code = torch.flatten(self.cnn_encoder(proj), start_dim=1)
+            
+            # Predict Euler angles directly using the Euler regressors.
+            # Each regressor in the ModuleList outputs a tensor of shape [B, 3].
+            pred_euler_list = [regressor(latent_code) for regressor in self.euler_regressor]
+            # Stack predictions along a new dimension to get shape [B, num_rotations, 3]
+            pred_euler_angles = torch.stack(pred_euler_list, dim=1)
 
-        #Swap the order of the angles to be ZYZ
-        # gt_angles = gt_angles[:, [2, 1, 0]]
+            pred_euler_angles[:, :, 0] = (pred_euler_angles[:, :, 0] + np.pi) % (2 * np.pi) - np.pi
+            pred_euler_angles[:, :, 1] = (pred_euler_angles[:, :, 1]) % np.pi
+            pred_euler_angles[:, :, 2] = (pred_euler_angles[:, :, 2] + np.pi) % (2 * np.pi) - np.pi
+            
+            # Extract initial and ground truth Euler angles from input rotation matrices.
+            init_angles = pytorch3d.transforms.matrix_to_euler_angles(in_dict['init_rots'], 'ZYZ')  # Shape: [B, 3]
+            gt_angles   = pytorch3d.transforms.matrix_to_euler_angles(in_dict['gt_rots'], 'ZYZ')    # Shape: [B, 3]
+            
+            # Compute differences for the initial angles and for the ground truth.
+            init_psi_diff   = pred_euler_angles[:, :, 0] - init_angles[:, 0].unsqueeze(1)
+            init_theta_diff = pred_euler_angles[:, :, 1] - init_angles[:, 1].unsqueeze(1)
+            init_phi_diff   = pred_euler_angles[:, :, 2] - init_angles[:, 2].unsqueeze(1)
+            
+            gt_psi_diff     = pred_euler_angles[:, :, 0] - gt_angles[:, 0].unsqueeze(1)
+            gt_theta_diff   = pred_euler_angles[:, :, 1] - gt_angles[:, 1].unsqueeze(1)
+            gt_phi_diff     = pred_euler_angles[:, :, 2] - gt_angles[:, 2].unsqueeze(1)
+            
+            # Convert the predicted Euler angles into rotation matrices.
+            B = latent_code.shape[0]
+            pred_rotmat = pytorch3d.transforms.euler_angles_to_matrix(
+                pred_euler_angles.view(-1, 3), 'ZYZ'
+            ).view(B, self.num_rotations, 3, 3)
+            # Flatten to a 3D tensor [B*num_rotations, 3, 3] for the decoder.
+            pred_rotmat = pred_rotmat.view(-1, 3, 3)
 
-        # Zero out deltas, and randomize phi, expect rotationally averaged
+        elif self.amortized_method == 'split_reg' or self.amortized_method == 'none':
+            # # encoder
+            # proj = in_dict['proj_input']
+            # proj = self.gaussian_filters(proj)
+            # latent_code = torch.flatten(self.cnn_encoder(proj), start_dim=1)
+            # all_latent_code_prerot = []
+            # for orientation_regressor in self.orientation_regressor:
+            #     latent_code_prerot = orientation_regressor(latent_code)
+            #     all_latent_code_prerot.append(latent_code_prerot)
+            # all_latent_code_prerot = torch.stack(all_latent_code_prerot, dim=1)
+            # pred_rotmat = self.latent_to_rot3d_fn(all_latent_code_prerot)
+            # pred_rotmat = pred_rotmat.view(-1, 3, 3)
 
-        # Construct final euler angles for each hypothesis
-        B = latent_code.shape[0]
-        # pred_angles = torch.zeros(B, self.num_rotations, 3, device=latent_code.device)
-        # pred_angles[:, :, 0] = gt_angles[:, 0:1].expand(-1, self.num_rotations) + delta_angles[:, 0:1].expand(-1, self.num_rotations)  # psi (second Z rotation)
-        # pred_angles[:, :, 1] = gt_angles[:, 1:2].expand(-1, self.num_rotations) + delta_angles[:, 1:2].expand(-1, self.num_rotations)  # theta (Y rotation)
-        # pred_angles[:, :, 2] = all_phi.squeeze(-1)  # phi (first Z rotation)
+            # # decoder
+            # out_dict = self.pred_map(pred_rotmat, r=r)
+            # pred_fproj_prectf = out_dict['pred_fproj_prectf']
+            # mask = out_dict['mask']
+            # B, _, H, W = pred_fproj_prectf.shape
+            # pred_fproj_prectf = pred_fproj_prectf.view(B // self.num_rotations, self.num_rotations, H, W)
+            # pred_rotmat = pred_rotmat.view(B // self.num_rotations, self.num_rotations, 3, 3)
 
-        pred_angles = torch.zeros(B, self.num_rotations, 3, device=latent_code.device)
-        pred_angles[:, :, 0] = gt_angles[:, 0:1].expand(-1, self.num_rotations)  # psi (second Z rotation)
-        pred_angles[:, :, 1] = gt_angles[:, 1:2].expand(-1, self.num_rotations)  # theta (Y rotation)
-        pred_angles[:, :, 2] = gt_angles[:, 2:3].expand(-1, self.num_rotations)  # phi (first Z rotation)
-        
-        
-        # Convert to rotation matrices
-        pred_rotmat = pytorch3d.transforms.euler_angles_to_matrix(
-            pred_angles.view(-1, 3), 'ZYZ'
-        ).view(B, self.num_rotations, 3, 3)
+            # # gt_rotmat = in_dict['gt_rots']
+
+            # # predicted_euler_angles = pytorch3d.transforms.matrix_to_euler_angles(pred_rotmat, 'ZYZ')
+
+            # # gt_euler_angles = pytorch3d.transforms.matrix_to_euler_angles(gt_rotmat, 'ZYZ')
+
+            # # predicted_euler_angles[0] = gt_euler_angles[0]
+            # # predicted_euler_angles[1] = gt_euler_angles[1]
+
+            # # pred_rotmat = pytorch3d.transforms.euler_angles_to_matrix(predicted_euler_angles, 'ZYZ')
+            proj = in_dict['proj_input']
+            proj = self.gaussian_filters(proj)
+            latent_code = torch.flatten(self.cnn_encoder(proj), start_dim=1)
+            
+            # Get delta_theta and delta_psi predictions and scale them
+            delta_angles = self.known_angle_regressor(latent_code) * self.angle_scale_factor
+            
+            # Get multiple phi predictions
+            all_phi = []
+            for phi_reg in self.phi_regressor:
+                phi = phi_reg(latent_code)  # Shape: [B, 1]
+                all_phi.append(phi)
+            all_phi = torch.stack(all_phi, dim=1)  # Shape: [B, num_rotations, 1]
+            
+            # Combine with known angles from input
+            init_angles = pytorch3d.transforms.matrix_to_euler_angles(in_dict['init_rots'], 'ZYZ')  # [B, 3]
+            # outputs rot tilt psi
+
+            # Zero out deltas, and randomize phi, expect rotationally averaged
+
+            gt_angles = pytorch3d.transforms.matrix_to_euler_angles(in_dict['gt_rots'], 'ZYZ')  # [B, 3]
+
+            # Construct final euler angles for each hypothesis
+            B = latent_code.shape[0]
+            pred_angles = torch.zeros(B, self.num_rotations, 3, device=latent_code.device)
+
+            if self.amortized_method == 'split_reg':
+                pred_angles[:, :, 0] = init_angles[:, 0:1].expand(-1, self.num_rotations) # + delta_angles[:, 0:1].expand(-1, self.num_rotations)
+                pred_angles[:, :, 1] = init_angles[:, 1:2].expand(-1, self.num_rotations) # + delta_angles[:, 1:2].expand(-1, self.num_rotations)  # theta (Y rotation)
+                pred_angles[:, :, 2] = all_phi.squeeze(-1)
+                # pred_angles[:, :, 2] = gt_angles[:, 2:3].expand(-1, self.num_rotations)
+                # pred_angles[:, :, 2] = init_angles[:, 2:3].expand(-1, self.num_rotations)
+            elif self.amortized_method == 'none':
+                pred_angles[:, :, 0] = init_angles[:, 0:1].expand(-1, self.num_rotations)
+                pred_angles[:, :, 1] = init_angles[:, 1:2].expand(-1, self.num_rotations)
+                pred_angles[:, :, 2] = init_angles[:, 2:3].expand(-1, self.num_rotations)
+            
+            # Convert to rotation matrices
+            pred_rotmat = pytorch3d.transforms.euler_angles_to_matrix(
+                pred_angles.view(-1, 3), 'ZYZ'
+            ).view(B, self.num_rotations, 3, 3)
+
+            # pred_angles_psi = (pred_angles[:, :, 0] + np.pi) % (2 * np.pi) - np.pi
+            # pred_angles_tilt = (pred_angles[:, :, 1]) % np.pi
+            # pred_angles_in_membrane = (pred_angles[:, :, 2] + np.pi) % (2 * np.pi) - np.pi
+
+            # Remove pose inference altogether, try using explicit again
+            # Expected: rotationally averaged
+            
+            # Reshape for decoder
+            pred_rotmat = pred_rotmat.view(-1, 3, 3)
+            # pred_euler_angles = pytorch3d.transforms.matrix_to_euler_angles(pred_rotmat, 'ZYZ')
+            # pred_euler_angles = pred_euler_angles.view(batch_size, self.num_rotations, 3)
+
+            # init comparison
+            init_psi_diff = angular_difference(pred_angles[:, :, 0], init_angles[:, 0].unsqueeze(1), 'in_plane')
+            init_theta_diff = angular_difference(pred_angles[:, :, 1], init_angles[:, 1].unsqueeze(1), 'tilt')
+            init_phi_diff = angular_difference(pred_angles[:, :, 2], init_angles[:, 2].unsqueeze(1), 'in_mem')
 
 
-        # Remove pose inference altogether, try using explicit again
-        # Expected: rotationally averaged
-        
-        # Reshape for decoder
-        pred_rotmat = pred_rotmat.view(-1, 3, 3)
+            # gt comparison
+            gt_psi_diff = angular_difference(pred_angles[:, :, 0], gt_angles[:, 0].unsqueeze(1), 'in_plane')
+            gt_theta_diff = angular_difference(pred_angles[:, :, 1], gt_angles[:, 1].unsqueeze(1), 'tilt')
+            gt_phi_diff = angular_difference(pred_angles[:, :, 2], gt_angles[:, 2].unsqueeze(1), 'in_mem')
 
         # decoder
         out_dict = self.pred_map(pred_rotmat, r=r)
@@ -204,9 +346,15 @@ class CryoSAPIENCE(nn.Module):
             )
 
         output_dict = {'rotmat': pred_rotmat,
-                       'pred_fproj': pred_fproj,
-                       'pred_fproj_prectf': pred_fproj_prectf,
-                       'mask': expanded_mask}
+                    'pred_fproj': pred_fproj,
+                    'pred_fproj_prectf': pred_fproj_prectf,
+                    'mask': expanded_mask,
+                    'init_psi_diff': init_psi_diff,
+                    'init_theta_diff': init_theta_diff,
+                    'init_phi_diff': init_phi_diff,
+                    'gt_psi_diff': gt_psi_diff,
+                    'gt_theta_diff': gt_theta_diff,
+                    'gt_phi_diff': gt_phi_diff}
 
         return output_dict
     

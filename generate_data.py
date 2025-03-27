@@ -11,11 +11,30 @@ import math
 import torch.nn.functional as F
 import mrcfile
 from torch.utils.data import Dataset, DataLoader
-from pytorch3d.transforms import random_rotations, matrix_to_euler_angles, euler_angles_to_matrix
+import pytorch3d.transforms
 from tqdm import tqdm
 import pandas as pd
 import starfile
 
+
+# Create new 128x128x128 volume first, and then run generate_data.py
+# Make sure to also change apix to the right value when storing
+# When checking in chimera, the new one should look like a less detailed version
+
+def fourier_crop3D(vol_tensor):
+    """Crops a 3D volume in the Fourier domain to 128x128x128.
+    Also return the new pixel size."""
+    vol_fft = torch.fft.fftshift(torch.fft.fftn(torch.fft.fftshift(vol_tensor)))
+    D, H, W = vol_fft.shape
+    crop_D, crop_H, crop_W = 128, 128, 128
+    start_D = (D - crop_D) // 2
+    start_H = (H - crop_H) // 2
+    start_W = (W - crop_W) // 2
+    cropped_fft = vol_fft[start_D:start_D+crop_D, start_H:start_H+crop_H, start_W:start_W+crop_W]
+    cropped_vol = torch.fft.ifftshift(torch.fft.ifftn(torch.fft.ifftshift(cropped_fft)))
+
+    
+    return cropped_vol, 
 
 def expand_fourier3D(f):
     expanded_f = torch.zeros((f.shape[0] + 1, f.shape[1] + 1, f.shape[2] + 1), dtype=f.dtype, device=f.device)
@@ -225,31 +244,32 @@ class DensityMapProjectionSimulator(Dataset):
         assert self.D % 2 == 1
         
         # Handle custom angles or random rotations
-        if euler_angles is not None:
-            self.num_projs = len(euler_angles)
-            # Convert degrees to radians and create rotation matrices
-            euler_angles_rad = np.radians(euler_angles)
-            self.rotmat = torch.zeros((self.num_projs, 3, 3))
-            for i in range(self.num_projs):
-                # Convert ZYZ Euler angles to rotation matrix
-                rot, tilt, psi = euler_angles_rad[i]
-                Rz1 = torch.tensor([[np.cos(rot), -np.sin(rot), 0],
-                                  [np.sin(rot), np.cos(rot), 0],
-                                  [0, 0, 1]])
-                Ry = torch.tensor([[np.cos(tilt), 0, np.sin(tilt)],
-                                 [0, 1, 0],
-                                 [-np.sin(tilt), 0, np.cos(tilt)]])
-                Rz2 = torch.tensor([[np.cos(psi), -np.sin(psi), 0],
-                                  [np.sin(psi), np.cos(psi), 0],
-                                  [0, 0, 1]])
-                self.rotmat[i] = Rz2 @ Ry @ Rz1
-        else:
-            self.num_projs = num_projs
-            euler_angles = create_preferred_angle_distribution(self.num_projs, preferred_tilt=90, tilt_std=10)
-            # Convert the numpy array to a float32 tensor of shape (n, 3)
-            euler_tensor = torch.tensor(euler_angles, dtype=torch.float32)
-            # Convert directly to rotation matrices of shape (n, 3, 3)
-            self.rotmat = euler_angles_to_matrix(euler_tensor, "ZYZ")
+        # if euler_angles is not None:
+        #     self.num_projs = len(euler_angles)
+        #     # Convert degrees to radians and create rotation matrices
+        #     euler_angles_rad = np.radians(euler_angles)
+        #     self.rotmat = torch.zeros((self.num_projs, 3, 3))
+        #     for i in range(self.num_projs):
+        #         # Convert ZYZ Euler angles to rotation matrix
+        #         rot, tilt, psi = euler_angles_rad[i]
+        #         Rz1 = torch.tensor([[np.cos(rot), -np.sin(rot), 0],
+        #                           [np.sin(rot), np.cos(rot), 0],
+        #                           [0, 0, 1]])
+        #         Ry = torch.tensor([[np.cos(tilt), 0, np.sin(tilt)],
+        #                          [0, 1, 0],
+        #                          [-np.sin(tilt), 0, np.cos(tilt)]])
+        #         Rz2 = torch.tensor([[np.cos(psi), -np.sin(psi), 0],
+        #                           [np.sin(psi), np.cos(psi), 0],
+        #                           [0, 0, 1]])
+        #         self.rotmat[i] = Rz2 @ Ry @ Rz1
+        # else:
+        self.num_projs = num_projs
+        euler_angles = create_preferred_angle_distribution(self.num_projs,
+                                                            preferred_tilt=90, tilt_std=10)
+        # Convert the numpy array to a float32 tensor of shape (n, 3)
+        euler_tensor = torch.tensor(euler_angles, dtype=torch.float32)
+        # Convert directly to rotation matrices of shape (n, 3, 3)
+        self.rotmat = pytorch3d.transforms.euler_angles_to_matrix(euler_tensor, "ZYZ")
 
         self.noise_generator = noise_generator
         self.ctf_generator = ctf_generator
@@ -266,6 +286,7 @@ class DensityMapProjectionSimulator(Dataset):
                 voxel_size = resolution
         self.mrc = mrc_data
         self.vol = torch.from_numpy(self.mrc).float()
+        self.vol = fourier_crop3D(self.vol)
         fvol = expand_fourier3D(self.p2f_3D(self.vol))
         self.fvol = torch.view_as_real(fvol).permute(3, 0, 1, 2)
 
@@ -429,12 +450,26 @@ def create_preferred_angle_distribution(num_projs, preferred_tilt=90, tilt_std=1
     
     # Generate angles with preferred orientation
     for i in range(num_projs):
-        rot = np.radians(np.random.uniform(-180, 180))
+        # psi = np.radians(np.random.uniform(-180, 180))
+
+        psi = np.radians(np.random.uniform(-10, 10))
+
+        # psi refers to the in-plane rotation of the particle
+        # When using default mrcfile
+        # psi = 0 -> particle points right
+        # psi = -90 -> particle points up
+        # psi = 90 -> particle points down
+        # psi = 180 -> particle points left
         tilt_delta = tilt_std * np.random.uniform(-1, 1)
         tilt = np.radians(preferred_tilt + tilt_delta)  # Ensure valid tilt angle
-        psi = np.radians(np.random.uniform(-180, 180))
+        # tilt = 0 -> particle is perpendicular to screen
+        # tilt = 90 -> particle is parallel to screen, thus equatorial view
+        rot = np.radians(np.random.uniform(-180, 180))
+        # rot corresponds to the in-membrane rotation of the particle
+        # i.e. the one that we have no prior over
+
         
-        angles[i] = [rot, tilt, psi]
+        angles[i] = [psi, tilt, rot]
     
     return angles
     
@@ -614,7 +649,7 @@ if __name__ == '__main__':
             B = projs.shape[0]
             S = projs.shape[-1]
             rotmats = model_input['rotmat']  # B, 3, 3
-            euler_angles_deg = np.degrees(matrix_to_euler_angles(rotmats, 'ZYZ').float().numpy())  # B, 3
+            euler_angles_deg = np.degrees(pytorch3d.transforms.matrix_to_euler_angles(rotmats, 'ZYZ').float().numpy())  # B, 3
             defocusU = model_input['defocusU'].float().numpy()  # B, 1, 1
             defocusV = model_input['defocusV'].float().numpy()  # B, 1, 1
             angleAstigmatism = model_input['angleAstigmatism'].float().numpy()  # B, 1, 1
