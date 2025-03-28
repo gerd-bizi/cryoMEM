@@ -195,18 +195,18 @@ class StarfileDataLoader(Dataset):
 
         # rotmat = pytorch3d.transforms.euler_angles_to_matrix(
         #     torch.tensor([
-        #         np.radians(particle['rlnAngleRot']),
+        #         np.radians(-particle['rlnAnglePsi']),
         #         np.radians(particle['rlnAngleTilt']),
-        #         np.radians(particle['rlnAnglePsi'])
+        #         np.radians(-particle['rlnAnglePsi'])
         #     ]),
         #     "ZYZ"
         # )
 
         # gt_rotmat = pytorch3d.transforms.euler_angles_to_matrix(
         #     torch.tensor([
-        #         np.radians(gt_particle['rlnAngleRot']),
+        #         np.radians(-gt_particle['rlnAnglePsi']),
         #         np.radians(gt_particle['rlnAngleTilt']),
-        #         np.radians(gt_particle['rlnAnglePsi'])
+        #         np.radians(-gt_particle['rlnAngleRot'])
         #     ]),
         #     "ZYZ"
         # )

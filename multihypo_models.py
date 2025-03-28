@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import pytorch3d.transforms
 from encoders import CNNEncoderVGG16, GaussianPyramid
-from utils.nets import FCBlock
+from utils.nets import FCBlock, UnitCirclePhiRegressor, ResidualAngleRegressor, GatedResidualAngleRegressor
 from decoders import Explicit3D, ImplicitFourierVolume
 from utils.ctf import CTFRelion
 from utils.real_ctf import ExperimentalCTF
@@ -25,16 +25,13 @@ def angular_difference(ang1, ang2, angle_type):
         The smallest angular difference respecting the periodic boundaries
     """
     if angle_type in ['in_mem', 'in_plane']:  # For angles with range [-π, π]
-        diff = (ang1 - ang2 + np.pi) % (2*np.pi) - np.pi
+        diff = ang2 - ang1
+        # Use torch.where instead of direct comparison
+        diff = torch.where(diff > np.pi, diff - 2 * np.pi, diff)
+        diff = torch.where(diff < -np.pi, diff + 2 * np.pi, diff)
     elif angle_type == 'tilt':  # For angles with range [0, π]
         # For theta, we need special handling since it's in [0, π]
-        # First compute raw difference
-        raw_diff = ang1 - ang2
-        
-        # For theta, we need to consider the spherical geometry
-        # If both angles are close to 0 or π, the direct difference is correct
-        # Otherwise, we need to account for the non-periodic nature of theta
-        diff = raw_diff
+        diff = ang2 - ang1
     else:
         raise ValueError(f"Unknown angle_type: {angle_type}")
         
@@ -112,28 +109,51 @@ class CryoSAPIENCE(nn.Module):
             ])
 
         elif amortized_method == 'split_reg' or amortized_method == 'none':
-            self.known_angle_regressor = FCBlock(
-                in_features=latent_code_size,
-                out_features=2,  # delta_theta, delta_psi
-                features=[256, 128],
-                nonlinearity='relu',
-                last_nonlinearity='tanh',  # outputs in [-1, 1]
-                batch_norm=True
-            )
-            self.angle_scale_factor = 1/18 * np.pi
+            # self.known_angle_regressor = FCBlock(
+            #     in_features=latent_code_size,
+            #     out_features=2,  # delta_theta, delta_psi
+            #     features=[256, 128],
+            #     nonlinearity='relu',
+            #     last_nonlinearity='tanh',  # outputs in [-1, 1]
+            #     batch_norm=True
+            # )
+            # self.angle_scale_factor = 1/18 * np.pi
+
+            # self.phi_regressor = nn.ModuleList([
+            #     FCBlock(
+            #         in_features=latent_code_size,
+            #         out_features=1,  # phi prediction
+            #         features=[256, 128],
+            #         nonlinearity='relu',
+            #         last_nonlinearity=None,
+            #         batch_norm=True
+            #     ) for _ in range(self.num_rotations)
+            # ])
 
             self.phi_regressor = nn.ModuleList([
-                FCBlock(
-                    in_features=latent_code_size,
-                    out_features=1,  # phi prediction
-                    features=[256, 128],
-                    nonlinearity='relu',
-                    last_nonlinearity=None,
-                    batch_norm=True
-                ) for _ in range(self.num_rotations)
+                UnitCirclePhiRegressor(latent_code_size)
+                for _ in range(self.num_rotations)
             ])
 
+            # self.residual_angle_regressor = ResidualAngleRegressor(
+            #     latent_dim=latent_code_size,  # from your CNN encoder
+            #     angle_dim=2,  # for theta and psi, for instance
+            #     hidden_features=[256, 128],
+            #     max_delta=np.deg2rad(10)  # 10° in radians
+            # )
 
+            self.gated_residual_angle_regressor_rot = GatedResidualAngleRegressor(
+                latent_dim=latent_code_size,
+                angle_dim=1,
+                hidden_features=[256, 128],
+                max_delta=np.deg2rad(10)
+            )
+            self.gated_residual_angle_regressor_tilt = GatedResidualAngleRegressor(
+                latent_dim=latent_code_size,
+                angle_dim=1,
+                hidden_features=[256, 128],
+                max_delta=np.deg2rad(10)
+            )
         if data_type == 'real':
             self.ctf = ExperimentalCTF()
         else:
@@ -260,20 +280,31 @@ class CryoSAPIENCE(nn.Module):
             proj = in_dict['proj_input']
             proj = self.gaussian_filters(proj)
             latent_code = torch.flatten(self.cnn_encoder(proj), start_dim=1)
-            
-            # Get delta_theta and delta_psi predictions and scale them
-            delta_angles = self.known_angle_regressor(latent_code) * self.angle_scale_factor
-            
-            # Get multiple phi predictions
-            all_phi = []
-            for phi_reg in self.phi_regressor:
-                phi = phi_reg(latent_code)  # Shape: [B, 1]
-                all_phi.append(phi)
-            all_phi = torch.stack(all_phi, dim=1)  # Shape: [B, num_rotations, 1]
-            
+
             # Combine with known angles from input
             init_angles = pytorch3d.transforms.matrix_to_euler_angles(in_dict['init_rots'], 'ZYZ')  # [B, 3]
             # outputs rot tilt psi
+            
+            # Get delta_theta and delta_psi predictions and scale them
+            refined_angles_rot = self.gated_residual_angle_regressor_rot(latent_code, init_angles[:, 0:1])
+            refined_angles_tilt = self.gated_residual_angle_regressor_tilt(latent_code, init_angles[:, 1:2])
+            # Get multiple phi predictions
+            # all_phi = []
+            # for phi_reg in self.phi_regressor:
+            #     phi = phi_reg(latent_code)  # Shape: [B, 1]
+            #     all_phi.append(phi)
+            # all_phi = torch.stack(all_phi, dim=1)  # Shape: [B, num_rotations, 1]
+
+
+            all_phi = []
+            for phi_reg in self.phi_regressor:
+                # Each returns a tensor of shape [B, 2]
+                phi_unit = phi_reg(latent_code)
+                all_phi.append(phi_unit)
+            # Stack to shape [B, num_rotations, 2]
+            all_phi = torch.stack(all_phi, dim=1)
+            # Compute the angle using atan2: gives angle in [-pi, pi]
+            phi_angles = torch.atan2(all_phi[..., 1], all_phi[..., 0])
 
             # Zero out deltas, and randomize phi, expect rotationally averaged
 
@@ -284,11 +315,14 @@ class CryoSAPIENCE(nn.Module):
             pred_angles = torch.zeros(B, self.num_rotations, 3, device=latent_code.device)
 
             if self.amortized_method == 'split_reg':
-                pred_angles[:, :, 0] = init_angles[:, 0:1].expand(-1, self.num_rotations) # + delta_angles[:, 0:1].expand(-1, self.num_rotations)
-                pred_angles[:, :, 1] = init_angles[:, 1:2].expand(-1, self.num_rotations) # + delta_angles[:, 1:2].expand(-1, self.num_rotations)  # theta (Y rotation)
-                pred_angles[:, :, 2] = all_phi.squeeze(-1)
+                # pred_angles[:, :, 0] = init_angles[:, 0:1].expand(-1, self.num_rotations) + delta_angles[:, 0:1].expand(-1, self.num_rotations)
+                # pred_angles[:, :, 1] = init_angles[:, 1:2].expand(-1, self.num_rotations) + delta_angles[:, 1:2].expand(-1, self.num_rotations)  # theta (Y rotation)
+                pred_angles[:, :, 0] = refined_angles_rot.expand(-1, self.num_rotations)
+                pred_angles[:, :, 1] = refined_angles_tilt.expand(-1, self.num_rotations)
+                # pred_angles[:, :, 2] = all_phi.squeeze(-1)
                 # pred_angles[:, :, 2] = gt_angles[:, 2:3].expand(-1, self.num_rotations)
                 # pred_angles[:, :, 2] = init_angles[:, 2:3].expand(-1, self.num_rotations)
+                pred_angles[:, :, 2] = phi_angles
             elif self.amortized_method == 'none':
                 pred_angles[:, :, 0] = init_angles[:, 0:1].expand(-1, self.num_rotations)
                 pred_angles[:, :, 1] = init_angles[:, 1:2].expand(-1, self.num_rotations)
@@ -312,15 +346,15 @@ class CryoSAPIENCE(nn.Module):
             # pred_euler_angles = pred_euler_angles.view(batch_size, self.num_rotations, 3)
 
             # init comparison
-            init_psi_diff = angular_difference(pred_angles[:, :, 0], init_angles[:, 0].unsqueeze(1), 'in_plane')
-            init_theta_diff = angular_difference(pred_angles[:, :, 1], init_angles[:, 1].unsqueeze(1), 'tilt')
-            init_phi_diff = angular_difference(pred_angles[:, :, 2], init_angles[:, 2].unsqueeze(1), 'in_mem')
+            init_psi_diff = angular_difference(init_angles[:, 0].unsqueeze(1), pred_angles[:, :, 0], 'in_plane')
+            init_theta_diff = angular_difference(init_angles[:, 1].unsqueeze(1), pred_angles[:, :, 1], 'tilt')
+            init_phi_diff = angular_difference(init_angles[:, 2].unsqueeze(1), pred_angles[:, :, 2], 'in_mem')
 
 
             # gt comparison
-            gt_psi_diff = angular_difference(pred_angles[:, :, 0], gt_angles[:, 0].unsqueeze(1), 'in_plane')
-            gt_theta_diff = angular_difference(pred_angles[:, :, 1], gt_angles[:, 1].unsqueeze(1), 'tilt')
-            gt_phi_diff = angular_difference(pred_angles[:, :, 2], gt_angles[:, 2].unsqueeze(1), 'in_mem')
+            gt_psi_diff = angular_difference(gt_angles[:, 0].unsqueeze(1), pred_angles[:, :, 0], 'in_plane')
+            gt_theta_diff = angular_difference(gt_angles[:, 1].unsqueeze(1), pred_angles[:, :, 1], 'tilt')
+            gt_phi_diff = angular_difference(gt_angles[:, 2].unsqueeze(1), pred_angles[:, :, 2], 'in_mem')
 
         # decoder
         out_dict = self.pred_map(pred_rotmat, r=r)

@@ -479,3 +479,90 @@ def build_model_fouriernet(nl, in_features, channels, layers, params, w0):
         return FCBlock(in_features, [params] * layers, 2 * channels, nonlinearity='relu')
     else:
         raise NotImplementedError
+    
+
+class UnitCirclePhiRegressor(nn.Module):
+    def __init__(self, in_features, hidden_features=[256, 128]):
+        super(UnitCirclePhiRegressor, self).__init__()
+        # Use your FCBlock here, but set out_features to 2
+        self.fc = FCBlock(
+            in_features=in_features,
+            features=hidden_features,
+            out_features=2,  # Now outputting two values
+            nonlinearity='relu',
+            last_nonlinearity=None,
+            batch_norm=True
+        )
+
+    def forward(self, x):
+        phi_vals = self.fc(x)  # shape: [B, 2]
+        # Normalize to force the output onto the unit circle.
+        norm = torch.norm(phi_vals, p=2, dim=-1, keepdim=True)
+        phi_unit = phi_vals / (norm + 1e-6)
+        return phi_unit
+    
+class ResidualAngleRegressor(nn.Module):
+    def __init__(self, latent_dim, angle_dim=2, hidden_features=[256, 128], max_delta=np.deg2rad(10)):
+        """
+        Parameters:
+        -----------
+        latent_dim : int
+            Dimensionality of the latent code.
+        angle_dim : int, default=2
+            Number of angles being refined.
+        hidden_features : list
+            Hidden layer sizes for the FC network.
+        max_delta : float
+            Maximum allowed angular correction (in radians); here, 10°.
+        """
+        super(ResidualAngleRegressor, self).__init__()
+        self.max_delta = max_delta
+        # The network takes as input both the latent code and the initial angles
+        self.fc = FCBlock(
+            in_features=latent_dim + angle_dim,
+            features=hidden_features,
+            out_features=angle_dim,
+            nonlinearity='relu',
+            last_nonlinearity='tanh',  # outputs in [-1, 1]
+            batch_norm=True
+        )
+
+    def forward(self, latent, init_angles):
+        # Concatenate the latent code with the initial angle estimates.
+        x = torch.cat([latent, init_angles], dim=1)
+        # The tanh output, scaled, ensures the residual is in [-max_delta, max_delta].
+        delta = self.fc(x) * self.max_delta
+        return delta
+    
+class GatedResidualAngleRegressor(nn.Module):
+    def __init__(self, latent_dim, angle_dim=2, hidden_features=[256, 128], max_delta=np.deg2rad(10)):
+        super(GatedResidualAngleRegressor, self).__init__()
+        self.max_delta = max_delta
+        
+        # Delta branch: predicts the correction
+        self.delta_fc = FCBlock(
+            in_features=latent_dim + angle_dim,
+            features=hidden_features,
+            out_features=angle_dim,
+            nonlinearity='relu',
+            last_nonlinearity='tanh',  # output in [-1, 1]
+            batch_norm=True
+        )
+        
+        # Gate branch: predicts a weight for blending, ensuring the initial guess has a say.
+        self.gate_fc = FCBlock(
+            in_features=latent_dim + angle_dim,
+            features=hidden_features,
+            out_features=angle_dim,
+            nonlinearity='relu',
+            last_nonlinearity='sigmoid',  # outputs in [0, 1]
+            batch_norm=True
+        )
+
+    def forward(self, latent, init_angles):
+        x = torch.cat([latent, init_angles], dim=1)
+        delta = self.delta_fc(x) * self.max_delta
+        gate = self.gate_fc(x)
+        # Blend: gate close to 1 means trusting the initial guess more.
+        refined_angles = gate * init_angles + (1 - gate) * (init_angles + delta)
+        return refined_angles

@@ -34,7 +34,7 @@ def fourier_crop3D(vol_tensor):
     cropped_vol = torch.fft.ifftshift(torch.fft.ifftn(torch.fft.ifftshift(cropped_fft)))
 
     
-    return cropped_vol, 
+    return cropped_vol
 
 def expand_fourier3D(f):
     expanded_f = torch.zeros((f.shape[0] + 1, f.shape[1] + 1, f.shape[2] + 1), dtype=f.dtype, device=f.device)

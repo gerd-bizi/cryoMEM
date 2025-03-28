@@ -421,7 +421,10 @@ if __name__ == "__main__":
         if model.amortized_method == 'split_reg' or model.amortized_method == 'none':
             encoder_params = [
                 {'params': model.cnn_encoder.parameters(), 'lr': args.encoder_lr},
-                {'params': model.known_angle_regressor.parameters(), 'lr': args.encoder_lr},
+                # {'params': model.known_angle_regressor.parameters(), 'lr': args.encoder_lr},
+                # {'params': model.residual_angle_regressor.parameters(), 'lr': args.encoder_lr},
+                {'params': model.gated_residual_angle_regressor_rot.parameters(), 'lr': args.encoder_lr},
+                {'params': model.gated_residual_angle_regressor_tilt.parameters(), 'lr': args.encoder_lr},
                 {'params': model.phi_regressor.parameters(), 'lr': args.encoder_lr}
             ]
         elif model.amortized_method == 's2s2' or model.amortized_method == 'penalty':

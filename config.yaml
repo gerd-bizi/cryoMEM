@@ -1,9 +1,9 @@
 amortized_method: none
-batch_size: 8
-data_type: all_correct
+batch_size: 16
+data_type: random_membrane_w_wobble
 decoder_lr: 0.005
 encoder_lr: 0.0001
-epochs_amortized: 2
+epochs_amortized: 4
 epochs_unamortized: 0
 num_rotations: 15
 path_to_checkpoint: none
