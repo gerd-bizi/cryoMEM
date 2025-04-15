@@ -116,3 +116,49 @@ def align_all_heads(pred_rotmats, gt_rotmats, ref_mat, flip):
     full_ang_dists_heads = np.stack(full_ang_dists_heads, axis=1)
     viewdir_ang_dists_heads = np.stack(viewdir_ang_dists_heads, axis=1)
     return full_ang_dists_heads, viewdir_ang_dists_heads
+
+def global_alignment(pred_rotmats, gt_rotmats):
+    """
+    Find the best global alignment between predictions and ground truths.
+    
+    Parameters:
+    -----------
+    pred_rotmats: numpy array of shape (N, 3, 3)
+        Predicted rotation matrices
+    gt_rotmats: numpy array of shape (N, 3, 3)
+        Ground truth rotation matrices
+        
+    Returns:
+    --------
+    aligned_preds: numpy array of shape (N, 3, 3)
+        Globally aligned predictions
+    best_ref_mat: numpy array of shape (3, 3)
+        The best alignment transformation
+    is_flipped: bool
+        Whether the best alignment includes a flip
+    min_error: float
+        The minimum error achieved
+    """
+    N = pred_rotmats.shape[0]
+    min_error = float('inf')
+    best_aligned_preds = None
+    best_ref_mat = None
+    is_flipped = False
+    
+    # Try each sample as reference
+    for i in range(min(N, 100)):  # Limit to 100 samples for efficiency
+        # Get reference transformation matrix
+        ref_mat = np.matmul(gt_rotmats[i].T, pred_rotmats[i])
+        # Apply to all predictions
+        aligned_preds = np.matmul(pred_rotmats, ref_mat.T)
+        
+        # Compute total error
+        error = np.sum(np.sum((gt_rotmats - aligned_preds) ** 2, axis=(1, 2)))
+        
+        # Update if better
+        if error < min_error:
+            min_error = error
+            best_aligned_preds = aligned_preds
+            best_ref_mat = ref_mat
+    
+    return best_aligned_preds, best_ref_mat, False, min_error # third false is because we don't flip

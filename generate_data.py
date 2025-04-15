@@ -450,9 +450,9 @@ def create_preferred_angle_distribution(num_projs, preferred_tilt=90, tilt_std=1
     
     # Generate angles with preferred orientation
     for i in range(num_projs):
-        # psi = np.radians(np.random.uniform(-180, 180))
+        psi = np.radians(np.random.uniform(-180, 180))
 
-        psi = np.radians(np.random.uniform(-10, 10))
+        # psi = np.radians(np.random.uniform(-10, 10))
 
         # psi refers to the in-plane rotation of the particle
         # When using default mrcfile
@@ -708,7 +708,7 @@ if __name__ == '__main__':
     df['optics'] = pd.DataFrame(optics)
     df['particles'] = pd.DataFrame(particles)
 
-    starfile_path = os.path.join(root_dir, 'data.star')
+    starfile_path = os.path.join(root_dir, 'all_correct.star')
 
     print("Writing starfile at " + str(starfile_path))
     starfile.write(df, starfile_path, overwrite=True)

@@ -7,9 +7,10 @@ import torch
 import os
 import healpy as hp
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
 from utils.mrc import save_mrc
-from utils.rot_calc_error import compute_rot_error_single
+from utils.rot_calc_error import compute_rot_error_single, global_alignment
 
 from dataset import RealDataset, StarfileDataLoader
 from torch.utils.data import DataLoader
@@ -58,6 +59,14 @@ def parse_args(config):
     parser.add_argument('--space', type=str, choices=['fourier', 'hartley'], default=config.get('space', 'hartley'))
     parser.add_argument('--decoder_lr', type=float, default=config.get('decoder_lr', 0.005))
     
+    # pre-unamortized regime (partial Euler angle optimization)
+    parser.add_argument('--epochs_pre_unamortized', type=int, default=config.get('epochs_pre_unamortized', 0))
+    parser.add_argument('--pre_unamortized_decoder_lr', type=float, default=config.get('pre_unamortized_decoder_lr', 0.003))
+    parser.add_argument('--pre_unamortized_rot_lr', type=float, default=config.get('pre_unamortized_rot_lr', 0.02))
+    parser.add_argument('--optimizable_angles', nargs='+', type=lambda x: x.lower() == 'true', 
+                        default=config.get('optimizable_angles', [True, True, False]),
+                        help='Which Euler angles to optimize in pre-unamortized regime (in-plane, tilt, in-membrane)')
+    
     # unamortized regime
     parser.add_argument('--epochs_unamortized', type=int, default=config.get('epochs_unamortized', 10))
     parser.add_argument('--unamortized_decoder_lr', type=float, default=config.get('unamortized_decoder_lr', 0.002))
@@ -70,6 +79,8 @@ def parse_args(config):
     parser.add_argument('--amortized_method', type=str, choices=['s2s2', 'euler', 'split_reg', 'none'], default=config.get('amortized_method', 's2s2'), help='Select the amortized inference method.')
     parser.add_argument('--w1', type=float, default=config.get('w1', 0.0))
     parser.add_argument('--w2', type=float, default=config.get('w2', 0.0))
+    parser.add_argument('--pose_lr', type=float, default=config.get('pose_lr', 0.01), help='Learning rate for pose optimization in unamortized regime')
+    parser.add_argument('--update_hyperparams', action='store_true', default=config.get('update_hyperparams', False), help='If set, update training hyperparameters from new config even when resuming from checkpoint')
 
     
     args = parser.parse_args()
@@ -153,69 +164,126 @@ def compute_amortized_loss(data_cuda, out_dict, psi_penalty_weight=0.0, theta_pe
     mask = out_dict['mask']              # shape: [B, M, H, W]
     batch_head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum(dim=(-1, -2))) / (mask.sum(dim=(-1, -2)) + 1e-8)  # shape: [B, M]
     
-    # Regularization: Add L2 penalties per head
-    psi_diff = out_dict['init_psi_diff']  # expected shape: [B, M]
-    theta_diff = out_dict['init_theta_diff']  # expected shape: [B, M]
-    psi_penalty = psi_penalty_weight * psi_diff.pow(2)
-    theta_penalty = theta_penalty_weight * theta_diff.pow(2)
+    # # Regularization: Add L2 penalties per head
+    # psi_diff = out_dict['init_psi_diff']  # expected shape: [B, M]
+    # theta_diff = out_dict['init_theta_diff']  # expected shape: [B, M]
+    # psi_penalty = psi_penalty_weight * psi_diff.pow(2)
+    # theta_penalty = theta_penalty_weight * theta_diff.pow(2)
     
-    total_loss = batch_head_loss + psi_penalty + theta_penalty  # shape: [B, M]
-    return total_loss
+    # total_loss = batch_head_loss + psi_penalty + theta_penalty  # shape: [B, M]
+    return batch_head_loss
 
-# New function to plot angle differences over epochs
-def plot_angle_differences(psi_errors_list, theta_errors_list, save_dir, tag=''):
-    epochs = range(-1, len(psi_errors_list) - 1)
-    avg_psi_errors = np.abs([np.mean(np.degrees(e)) for e in psi_errors_list])
-    avg_theta_errors = np.abs([np.mean(np.degrees(e)) for e in theta_errors_list])
+# Update function signatures to take rotation matrices directly
+def plot_angle_differences(pred_rotmats_over_epochs, gt_rotmats, save_dir, tag=''):
+    """
+    Plots average angle differences over epochs given a list of predicted rotation matrices.
+    Computes errors directly from rotation matrices at plotting time.
+    
+    Parameters:
+    -----------
+    pred_rotmats_over_epochs: list of numpy arrays
+        List of predicted rotation matrices for each epoch, shape (N, 3, 3) each
+    gt_rotmats: numpy array
+        Ground truth rotation matrices, shape (N, 3, 3)
+    save_dir: str
+        Directory to save the plot
+    tag: str
+        Additional tag for the filename
+    """
+    epochs = range(len(pred_rotmats_over_epochs))
+    avg_psi_errors = []
+    avg_theta_errors = []
+    
+    for epoch_rotmats in pred_rotmats_over_epochs:
+        # Convert to euler angles using ZYZ convention
+        pred_euler = pytorch3d.transforms.matrix_to_euler_angles(torch.tensor(epoch_rotmats), convention="ZYZ").numpy()
+        gt_euler = pytorch3d.transforms.matrix_to_euler_angles(torch.tensor(gt_rotmats), convention="ZYZ").numpy()
+        
+        # Calculate angle differences (psi and theta)
+        psi_diff = np.abs(np.degrees(pred_euler[:, 0]) - np.degrees(gt_euler[:, 0]))
+        psi_diff = np.minimum(psi_diff, 360 - psi_diff)  # Account for periodic boundary
+        
+        theta_diff = np.abs(np.degrees(pred_euler[:, 1]) - np.degrees(gt_euler[:, 1]))
+        theta_diff = np.minimum(theta_diff, 180 - theta_diff)  # Account for periodic boundary
+        
+        avg_psi_errors.append(np.mean(psi_diff))
+        avg_theta_errors.append(np.mean(theta_diff))
+    
     plt.figure()
     plt.plot(epochs, avg_psi_errors, marker='o', label='in-plane absolute error')
     plt.plot(epochs, avg_theta_errors, marker='o', label='tilt absolute error')
     plt.xlabel('Epoch')
     plt.ylabel('Absolute error (degrees)')
-    plt.title(f'Angle differences over amortized training ({tag})')
+    plt.title(f'Angle differences over training ({tag})')
     plt.legend()
     plt.savefig(os.path.join(save_dir, f'angle_differences_{tag}.png'))
     plt.close()
 
-def plot_phi_angle_differences(phi_errors_list, save_dir, tag=''):
-    epochs = range(-1, len(phi_errors_list) - 1)
-    avg_phi_errors = np.abs([np.mean(np.degrees(e)) for e in phi_errors_list])
+def plot_phi_angle_differences(pred_rotmats_over_epochs, gt_rotmats, save_dir, tag=''):
+    """
+    Plots average phi (in-membrane) angle differences over epochs directly from rotation matrices.
+    
+    Parameters are same as plot_angle_differences.
+    """
+    epochs = range(len(pred_rotmats_over_epochs))
+    avg_phi_errors = []
+    
+    for epoch_rotmats in pred_rotmats_over_epochs:
+        # Convert to euler angles using ZYZ convention
+        pred_euler = pytorch3d.transforms.matrix_to_euler_angles(torch.tensor(epoch_rotmats), convention="ZYZ").numpy()
+        gt_euler = pytorch3d.transforms.matrix_to_euler_angles(torch.tensor(gt_rotmats), convention="ZYZ").numpy()
+        
+        # Calculate phi differences and account for periodicity
+        phi_diff = np.abs(np.degrees(pred_euler[:, 2]) - np.degrees(gt_euler[:, 2]))
+        phi_diff = np.minimum(phi_diff, 360 - phi_diff)
+        
+        avg_phi_errors.append(np.mean(phi_diff))
+    
     plt.figure()
     plt.plot(epochs, avg_phi_errors, marker='o', label='in-membrane absolute error')
     plt.xlabel('Epoch')
     plt.ylabel('Absolute error (degrees)')
-    plt.title(f'φ angle differences over amortized training ({tag})')
+    plt.title(f'φ angle differences over training ({tag})')
     plt.legend()
     plt.savefig(os.path.join(save_dir, f'phi_angle_differences_{tag}.png'))
     plt.close()
 
-def plot_error_histograms(psi_errors, theta_errors, phi_errors, epoch, save_dir, tag=''):
+def plot_error_histograms(pred_rotmats, gt_rotmats, epoch, save_dir, tag=''):
     """
-    Plots histograms of the signed angle errors (difference from ground truth)
-    for each angle. The output figure contains three subplots (one for each angle)
-    and is saved as an image with title 'epoch_{epoch}_angle_errors'.
+    Plots histograms of the angle errors computed directly from rotation matrices.
     """
-    # Convert errors from radians to degrees.
-    psi_deg = np.degrees(psi_errors)
-    theta_deg = np.degrees(theta_errors)
-    phi_deg = np.degrees(phi_errors)
+    # Convert to euler angles using ZYZ convention
+    pred_euler = pytorch3d.transforms.matrix_to_euler_angles(torch.tensor(pred_rotmats), convention="ZYZ").numpy()
+    gt_euler = pytorch3d.transforms.matrix_to_euler_angles(torch.tensor(gt_rotmats), convention="ZYZ").numpy()
+
+    
+    # Calculate angle differences
+    psi_deg = np.degrees(pred_euler[:, 0]) - np.degrees(gt_euler[:, 0])
+    theta_deg = np.degrees(pred_euler[:, 1]) - np.degrees(gt_euler[:, 1])
+    phi_deg = np.degrees(pred_euler[:, 2]) - np.degrees(gt_euler[:, 2])
+    
+    # Adjust for periodic boundaries
+    psi_deg = ((psi_deg + 180) % 360) - 180
+    phi_deg = ((phi_deg + 180) % 360) - 180
+    theta_deg = ((theta_deg + 90) % 180) - 90
     
     fig, axs = plt.subplots(1, 3, figsize=(18, 6))
     
-    axs[0].hist(phi_deg, bins=30, color='blue', alpha=0.7)
-    axs[0].set_title(f'Epoch {epoch} rlnAngleRot Error')
-    axs[0].set_xlabel('Error (deg)')
-    axs[0].set_ylabel('Frequency')
+    axs[2].hist(psi_deg, bins=30, color='red', alpha=0.7)
+    axs[2].set_title(f'Epoch {epoch} rlnAnglePsi Error')
+    axs[2].set_xlabel('Error (deg)')
+    axs[2].set_ylabel('Frequency')    
     
     axs[1].hist(theta_deg, bins=30, color='green', alpha=0.7)
     axs[1].set_title(f'Epoch {epoch} rlnAngleTilt Error')
     axs[1].set_xlabel('Error (deg)')
     axs[1].set_ylabel('Frequency')
-    
-    axs[2].hist(psi_deg, bins=30, color='red', alpha=0.7)
-    axs[2].set_title(f'Epoch {epoch} rlnAnglePsi Error')
-    axs[2].set_xlabel('Error (deg)')
-    axs[2].set_ylabel('Frequency')
+
+    axs[0].hist(phi_deg, bins=30, color='blue', alpha=0.7)
+    axs[0].set_title(f'Epoch {epoch} rlnAngleRot Error')
+    axs[0].set_xlabel('Error (deg)')
+    axs[0].set_ylabel('Frequency')
+
     
     fig.suptitle(f'epoch_{epoch}_angle_errors', fontsize=16)
     
@@ -224,16 +292,23 @@ def plot_error_histograms(psi_errors, theta_errors, phi_errors, epoch, save_dir,
     plt.savefig(os.path.join(save_dir, 'angle_errors', f'epoch_{epoch}_angle_errors_{tag}.png'))
     plt.close()
 
-def plot_error_scatter(psi_errors, theta_errors, phi_errors, epoch, save_dir, tag=''):
+def plot_error_scatter(pred_rotmats, gt_rotmats, epoch, save_dir, tag=''):
     """
-    Generates scatter plots comparing the signed angle errors between each pair
-    of angles. Three scatter plots are created in one figure and saved as an image with
-    title 'epoch_{epoch}_error_scatter'.
+    Generates scatter plots comparing the angle errors between angles directly from rotation matrices.
     """
-    # Convert errors from radians to degrees.
-    psi_deg = np.degrees(psi_errors)
-    theta_deg = np.degrees(theta_errors)
-    phi_deg = np.degrees(phi_errors)
+    # Convert to euler angles using ZYZ convention
+    pred_euler = pytorch3d.transforms.matrix_to_euler_angles(torch.tensor(pred_rotmats), convention="ZYZ").numpy()
+    gt_euler = pytorch3d.transforms.matrix_to_euler_angles(torch.tensor(gt_rotmats), convention="ZYZ").numpy()
+    
+    # Calculate angle differences
+    psi_deg = np.degrees(pred_euler[:, 0] - gt_euler[:, 0])
+    theta_deg = np.degrees(pred_euler[:, 1] - gt_euler[:, 1])
+    phi_deg = np.degrees(pred_euler[:, 2] - gt_euler[:, 2])
+    
+    # Adjust for periodic boundaries
+    psi_deg = ((psi_deg + 180) % 360) - 180
+    phi_deg = ((phi_deg + 180) % 360) - 180
+    theta_deg = ((theta_deg + 90) % 180) - 90
     
     fig, axs = plt.subplots(1, 3, figsize=(18, 6))
     
@@ -263,8 +338,7 @@ def plot_pred_vs_gt_scatter(pred_rotmats, gt_rotmats, iteration, save_dir, tag='
     """
     Plots scatter plots comparing predicted and ground-truth Euler angles
     for each of the three angles: in-plane, tilt, and in-membrane.
-    For each subplot, the x-axis shows the predicted angle (in degrees) and the y-axis shows the
-    ground truth angle (in degrees). With ~6116 particles we expect 6116 points per plot.
+    Uses a 2D histogram with a color gradient to show point density.
     
     Parameters
     ----------
@@ -303,23 +377,53 @@ def plot_pred_vs_gt_scatter(pred_rotmats, gt_rotmats, iteration, save_dir, tag='
 
     fig, axs = plt.subplots(1, 3, figsize=(18, 6))
     for i, ax in enumerate(axs):
-        ax.scatter(pred_deg[:, i], gt_deg[:, i], alpha=0.5, s=10)
+        # Create 2D histogram with more bins for finer resolution
+        if angle_names[i] == "tilt":
+            xlim = (0, 180)
+            ylim = (0, 180)
+            bins = 72
+        else:
+            xlim = (-180, 180)
+            ylim = (-180, 180)
+            bins = 72
+        
+        hist, xedges, yedges, im = ax.hist2d(pred_deg[:, i], gt_deg[:, i], 
+                                            range=[xlim, ylim], 
+                                            bins=bins, cmap='viridis', norm=LogNorm())
+        
         ax.set_xlabel(f'Predicted {angle_names[i]} (deg)')
         ax.set_ylabel(f'Ground Truth {angle_names[i]} (deg)')
         ax.set_title(f'Predicted vs Ground Truth {angle_names[i]}')
-        if angle_names[i] == "tilt":
-            ax.set_xlim(0, 180)
-            ax.set_ylim(0, 180)
-        else:
-            ax.set_xlim(-180, 180)
-            ax.set_ylim(-180, 180)
+        
+        # Add colorbar
+        cb = fig.colorbar(im, ax=ax)
+        cb.set_label('Count')
+        
+        # Add y=x reference line
         lims = ax.get_xlim()
-        ax.plot(lims, lims, 'k--', linewidth=0.5)  # Add y=x reference line
-    fig.suptitle(f"Predicted vs Ground Truth Euler Angles at Epoch {iteration} {tag}")
+        ax.plot(lims, lims, 'r--', linewidth=0.5)
+        
+        # Add text box with min/max counts
+        ax.text(0.05, 0.95, f"min: {int(hist.min())}, max: {int(hist.max())}",
+                transform=ax.transAxes, verticalalignment='top',
+                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+    # Add tag to title if provided
+    title = f"Predicted vs Ground Truth Euler Angles at Epoch {iteration}"
+    if tag:
+        title += f" ({tag})"
+    fig.suptitle(title, fontsize=16)
+    
     out_dir = os.path.join(save_dir, 'pred_vs_gt')
     os.makedirs(out_dir, exist_ok=True)
-    outfile = os.path.join(out_dir, f'pred_vs_gt_scatter_ep_{iteration}_{tag}.png')
-    plt.savefig(outfile)
+    
+    # Fix filename construction to handle empty tags
+    if tag:
+        outfile = os.path.join(out_dir, f'pred_vs_gt_scatter_ep_{iteration}_{tag}.png')
+    else:
+        outfile = os.path.join(out_dir, f'pred_vs_gt_scatter_ep_{iteration}.png')
+        
+    plt.savefig(outfile, dpi=300)  # Increased DPI for better resolution
     plt.close()
 
 
@@ -342,6 +446,21 @@ if __name__ == "__main__":
     hartley = args.space == 'hartley'
     writer = SummaryWriter(os.path.join(save_path, 'tbd'))
 
+    # Create directories
+    reconst_volume_paths = os.path.join(save_path, 'reconst_volumes')
+    orientation_dist_paths = os.path.join(save_path, 'orientation_distributions')
+    pred_vs_gt_path = os.path.join(save_path, 'pred_vs_gt')
+    ckpt_path = os.path.join(save_path, 'ckpt')
+    
+    for path in [reconst_volume_paths, orientation_dist_paths, pred_vs_gt_path, ckpt_path]:
+        if not os.path.exists(path):
+            os.makedirs(path)
+        elif path == pred_vs_gt_path:
+            # Clean up any existing pred_vs_gt plots to avoid confusion
+            for old_file in os.listdir(path):
+                if old_file.startswith('pred_vs_gt_scatter_ep_'):
+                    os.remove(os.path.join(path, old_file))
+                    
     # load data
     B = args.batch_size
     num_workers = 8
@@ -369,6 +488,10 @@ if __name__ == "__main__":
     elif args.data_type == 'correct_mem_w_wobble':
         dataset = StarfileDataLoader(img_sz, path_to_starfile='/fs01/datasets/empiar/vatpase_synth_restricted', input_starfile='correct_mem_w_wobble.star', invert_hand=False)
         print("Using correct_mem_w_wobble dataset")
+    elif args.data_type == 'real':
+        dataset = RealDataset(invert_data=~args.uninvert_data)
+
+
     dataloader = DataLoader(dataset, shuffle=True, batch_size=B, pin_memory=True,
                             num_workers=num_workers, drop_last=False)
     
@@ -391,28 +514,12 @@ if __name__ == "__main__":
     # import pdb; pdb.set_trace()
     model.cuda()
 
-    epochs_amortized = args.epochs_amortized
-    experimental = True
-
-    # Create directories
-    reconst_volume_paths = os.path.join(save_path, 'reconst_volumes')
-    orientation_dist_paths = os.path.join(save_path, 'orientation_distributions')
-    ckpt_path = os.path.join(save_path, 'ckpt')
-    
-    for path in [reconst_volume_paths, orientation_dist_paths, ckpt_path]:
-        if not os.path.exists(path):
-            os.makedirs(path)
+    init_epoch = 0
+    total_time = 0
 
     # pose amortized inference and reconstruction
+    epochs_amortized = args.epochs_amortized
     if epochs_amortized > 0:
-        # create paths
-        reconst_volume_paths = os.path.join(save_path, 'reconst_volumes')
-        if not os.path.exists(reconst_volume_paths):
-            os.makedirs(reconst_volume_paths)
-        ckpt_path = os.path.join(save_path, 'ckpt')
-        if not os.path.exists(ckpt_path):
-            os.makedirs(ckpt_path)
-
         # decoder optimizer
         decoder_params = [{'params': model.pred_map.parameters(), 'lr': args.decoder_lr}]
         decoder_optim = torch.optim.Adam(decoder_params)
@@ -441,64 +548,57 @@ if __name__ == "__main__":
 
         # amortized training
         r = args.r
-        total_time = 0
         
         # Run inference on the entire dataset in evaluation mode without gradient computations.
         model.eval()
-        init_psi_errors_list, init_theta_errors_list, init_phi_errors_list = [], [], []
-        gt_psi_errors_list, gt_theta_errors_list, gt_phi_errors_list = [], [], []
+        # Track predicted rotations over epochs for plotting trends
+        pred_rotmats_over_epochs = []
+        global_aligned_pred_rotmats_over_epochs = []
         
-        # Evaluate the initial errors (epoch 0 evaluation) before training begins.
-        print("Evaluating initial model (epoch 0)...")
-        # preallocate error arrays over the entire dataset
-        errors_init_psi = np.zeros(len(dataset))
-        errors_init_theta = np.zeros(len(dataset))
-        errors_init_phi = np.zeros(len(dataset))
-        errors_gt_psi = np.zeros(len(dataset))
-        errors_gt_theta = np.zeros(len(dataset))
-        errors_gt_phi = np.zeros(len(dataset))
-
-        for data in tqdm(dataloader, desc="Epoch 0 evaluation"):
+        # Evaluate the initial model (epoch 0)
+        print("Evaluating initial model (epoch -1)...")
+        # Collect predicted, ground truth, and initial rotations
+        pred_rotmats = np.zeros((len(dataset), 3, 3))
+        gt_rotmats = np.zeros((len(dataset), 3, 3))
+        init_rotmats = np.zeros((len(dataset), 3, 3))
+        
+        for data in tqdm(dataloader, desc="Epoch -1 evaluation"):
             data_cuda = dict2cuda(data)
             idxs = data_cuda['idx'].detach().cpu().numpy()
             out_dict = model(data_cuda, r=r, amortized=True)
-            # Compute head losses and determine the chosen rotation (hypothesis) per sample.
+            
+            # Compute head losses and determine the chosen rotation per sample
             head_loss = compute_amortized_loss(data_cuda, out_dict,
-                                               psi_penalty_weight=args.w1,
-                                               theta_penalty_weight=args.w2)
-            # print(head_loss.shape)
+                                              psi_penalty_weight=args.w1,
+                                              theta_penalty_weight=args.w2)
             batch_min_head_idx = torch.argmin(head_loss, dim=1).cpu().numpy()
             B = len(idxs)
-            # Get per-hypothesis absolute errors for each angle difference.
-            init_psi_all = out_dict['init_psi_diff'].detach().cpu().numpy()  # shape [B, M]
-            init_theta_all = out_dict['init_theta_diff'].detach().cpu().numpy()
-            init_phi_all = out_dict['init_phi_diff'].detach().cpu().numpy()
-            gt_psi_all = out_dict['gt_psi_diff'].detach().cpu().numpy()
-            gt_theta_all = out_dict['gt_theta_diff'].detach().cpu().numpy()
-            gt_phi_all = out_dict['gt_phi_diff'].detach().cpu().numpy()
             
-            # Choose the error corresponding to the hypothesis with the minimum head loss.
-            chosen_init_psi = init_psi_all[np.arange(B), batch_min_head_idx]
-            chosen_init_theta = init_theta_all[np.arange(B), batch_min_head_idx]
-            chosen_init_phi = init_phi_all[np.arange(B), batch_min_head_idx]
-            chosen_gt_psi = gt_psi_all[np.arange(B), batch_min_head_idx]
-            chosen_gt_theta = gt_theta_all[np.arange(B), batch_min_head_idx]
-            chosen_gt_phi = gt_phi_all[np.arange(B), batch_min_head_idx]
+            # Save raw predictions, ground truth, and initial rotations
+            rotmats_batch = out_dict['rotmat'].detach().cpu().numpy().reshape(B, -1, 3, 3)
             
-            errors_init_psi[idxs] = chosen_init_psi
-            errors_init_theta[idxs] = chosen_init_theta
-            errors_init_phi[idxs] = chosen_init_phi
-            errors_gt_psi[idxs] = chosen_gt_psi
-            errors_gt_theta[idxs] = chosen_gt_theta
-            errors_gt_phi[idxs] = chosen_gt_phi
-
-        # Save the initial (epoch 0) per-particle error values.
-        init_psi_errors_list.append(errors_init_psi)
-        init_theta_errors_list.append(errors_init_theta)
-        init_phi_errors_list.append(errors_init_phi)
-        gt_psi_errors_list.append(errors_gt_psi)
-        gt_theta_errors_list.append(errors_gt_theta)
-        gt_phi_errors_list.append(errors_gt_phi)
+            for i, idx in enumerate(idxs):
+                pred_rotmats[idx] = rotmats_batch[i, batch_min_head_idx[i]]
+                gt_rotmats[idx] = data_cuda['gt_rots'][i].detach().cpu().numpy()
+                init_rotmats[idx] = data_cuda['init_rots'][i].detach().cpu().numpy()
+        
+        # Perform global alignment on all collected predictions at once
+        global_aligned_pred_rotmats, _, _, _ = global_alignment(pred_rotmats, gt_rotmats)
+        
+        # Store first epoch predictions
+        pred_rotmats_over_epochs.append(pred_rotmats.copy())
+        global_aligned_pred_rotmats_over_epochs.append(global_aligned_pred_rotmats.copy())
+        
+        # Plot initial distributions - use original predictions for orientation distribution
+        plot_orientation_distribution(pred_rotmats, -1, orientation_dist_paths)
+        
+        # Use globally aligned predictions for GT comparisons and original predictions for initial comparisons
+        plot_error_histograms(global_aligned_pred_rotmats, gt_rotmats, -1, save_path, tag='gt')
+        plot_error_histograms(pred_rotmats, init_rotmats, -1, save_path, tag='initial')
+        plot_error_scatter(global_aligned_pred_rotmats, gt_rotmats, -1, save_path, tag='gt')
+        plot_error_scatter(pred_rotmats, init_rotmats, -1, save_path, tag='initial')
+        plot_pred_vs_gt_scatter(pred_rotmats, gt_rotmats, -1, save_path, tag='unaligned')
+        plot_pred_vs_gt_scatter(global_aligned_pred_rotmats, gt_rotmats, -1, save_path, tag='aligned')
 
         for iteration in range(epochs_amortized):
             t1 = time.time()
@@ -531,73 +631,48 @@ if __name__ == "__main__":
                 filename = os.path.join(reconst_volume_paths, f'ep_{iteration}.mrc')
                 save_mrc(filename, vol, voxel_size=resolution, header_origin=None)
                 
-                # Preallocate arrays for per-particle errors.
-                errors_init_psi = np.zeros(len(dataset))
-                errors_init_theta = np.zeros(len(dataset))
-                errors_init_phi = np.zeros(len(dataset))
-                errors_gt_psi = np.zeros(len(dataset))
-                errors_gt_theta = np.zeros(len(dataset))
-                errors_gt_phi = np.zeros(len(dataset))
-                
-                # Also collect the predicted rotations for the orientation distribution plot.
-                gt_rotmats = np.zeros((len(dataset), 3, 3))
+                # Collect all predictions and ground truth after each epoch
                 pred_rotmats = np.zeros((len(dataset), 3, 3))
+                gt_rotmats = np.zeros((len(dataset), 3, 3))
+                init_rotmats = np.zeros((len(dataset), 3, 3))
                 
                 for data in tqdm(dataloader, desc=f"Epoch {iteration} evaluation"):
                     data_cuda = dict2cuda(data)
                     idxs = data_cuda['idx'].detach().cpu().numpy()
                     out_dict = model(data_cuda, r=r, amortized=True)
                     
-                    # Calculate head losses to select the best hypothesis per sample.
+                    # Calculate head losses to select the best hypothesis per sample
                     head_loss = compute_amortized_loss(data_cuda, out_dict,
-                                                       psi_penalty_weight=args.w1,
-                                                       theta_penalty_weight=args.w2)
+                                                      psi_penalty_weight=args.w1,
+                                                      theta_penalty_weight=args.w2)
                     batch_min_head_idx = torch.argmin(head_loss, dim=1).cpu().numpy()
                     B = len(idxs)
-    
-                    # Save the selected rotation from the multiple hypotheses.
+                    
+                    # Save all types of rotations from the multiple hypotheses
                     rotmats_batch = out_dict['rotmat'].detach().cpu().numpy().reshape(B, -1, 3, 3)
+                    
                     for i, idx in enumerate(idxs):
                         pred_rotmats[idx] = rotmats_batch[i, batch_min_head_idx[i]]
                         gt_rotmats[idx] = data_cuda['gt_rots'][i].detach().cpu().numpy()
-                    # Get absolute error values from the model for each angle.
-                    init_psi_all = out_dict['init_psi_diff'].detach().cpu().numpy()
-                    init_theta_all = out_dict['init_theta_diff'].detach().cpu().numpy()
-                    init_phi_all = out_dict['init_phi_diff'].detach().cpu().numpy()
-                    gt_psi_all = out_dict['gt_psi_diff'].detach().cpu().numpy()
-                    gt_theta_all = out_dict['gt_theta_diff'].detach().cpu().numpy()
-                    gt_phi_all = out_dict['gt_phi_diff'].detach().cpu().numpy()
-                    
-                    chosen_init_psi = init_psi_all[np.arange(B), batch_min_head_idx]
-                    chosen_init_theta = init_theta_all[np.arange(B), batch_min_head_idx]
-                    chosen_init_phi = init_phi_all[np.arange(B), batch_min_head_idx]
-                    chosen_gt_psi = gt_psi_all[np.arange(B), batch_min_head_idx]
-                    chosen_gt_theta = gt_theta_all[np.arange(B), batch_min_head_idx]
-                    chosen_gt_phi = gt_phi_all[np.arange(B), batch_min_head_idx]
-    
-                    errors_init_psi[idxs] = chosen_init_psi
-                    errors_init_theta[idxs] = chosen_init_theta
-                    errors_init_phi[idxs] = chosen_init_phi
-                    errors_gt_psi[idxs] = chosen_gt_psi
-                    errors_gt_theta[idxs] = chosen_gt_theta
-                    errors_gt_phi[idxs] = chosen_gt_phi
+                        init_rotmats[idx] = data_cuda['init_rots'][i].detach().cpu().numpy()
                 
-    
-                # Append the full per-particle error arrays to your lists.
-                init_psi_errors_list.append(errors_init_psi)
-                init_theta_errors_list.append(errors_init_theta)
-                init_phi_errors_list.append(errors_init_phi)
-                gt_psi_errors_list.append(errors_gt_psi)
-                gt_theta_errors_list.append(errors_gt_theta)
-                gt_phi_errors_list.append(errors_gt_phi)
-    
-                # Plot orientation distribution as before.
+                # Perform global alignment on all collected predictions
+                global_aligned_pred_rotmats, _, _, _ = global_alignment(pred_rotmats, gt_rotmats)
+                
+                # Store this epoch's predictions
+                pred_rotmats_over_epochs.append(pred_rotmats.copy())
+                global_aligned_pred_rotmats_over_epochs.append(global_aligned_pred_rotmats.copy())
+                
+                # Plot orientation distribution using original predictions
                 plot_orientation_distribution(pred_rotmats, iteration, orientation_dist_paths)
-                plot_error_histograms(errors_gt_psi, errors_gt_theta, errors_gt_phi, iteration, save_path, tag='gt')
-                plot_error_scatter(errors_gt_psi, errors_gt_theta, errors_gt_phi, iteration, save_path, tag='gt')
-                plot_error_histograms(errors_init_psi, errors_init_theta, errors_init_phi, iteration, save_path, tag='init')
-                plot_error_scatter(errors_init_psi, errors_init_theta, errors_init_phi, iteration, save_path, tag='init')
-                plot_pred_vs_gt_scatter(pred_rotmats, gt_rotmats, iteration, save_path)
+                
+                # Use globally aligned predictions for GT comparisons and original predictions for initial comparisons
+                plot_error_histograms(global_aligned_pred_rotmats, gt_rotmats, iteration, save_path, tag='gt')
+                plot_error_histograms(pred_rotmats, init_rotmats, iteration, save_path, tag='initial')
+                plot_error_scatter(global_aligned_pred_rotmats, gt_rotmats, iteration, save_path, tag='gt')
+                plot_error_scatter(pred_rotmats, init_rotmats, iteration, save_path, tag='initial')
+                plot_pred_vs_gt_scatter(pred_rotmats, gt_rotmats, iteration, save_path, tag='unaligned')
+                plot_pred_vs_gt_scatter(global_aligned_pred_rotmats, gt_rotmats, iteration, save_path, tag='aligned')
 
                 # save model and optimizer states
                 checkpoint = { 
@@ -605,15 +680,17 @@ if __name__ == "__main__":
                     'total_time': total_time,
                     'model': model.state_dict(),
                     'optimizer': decoder_optim.state_dict()}
-                # torch.save(checkpoint, os.path.join(ckpt_path, f'ep_{iteration}.pth'))
+                if iteration == epochs_amortized - 1:
+                    torch.save(checkpoint, os.path.join(ckpt_path, f'ep_{iteration}.pth'))
 
-        # Plot angle differences after amortized training
-        plot_angle_differences(init_psi_errors_list, init_theta_errors_list, save_path, tag='init')
-        plot_angle_differences(gt_psi_errors_list, gt_theta_errors_list, save_path, tag='gt')
-        plot_phi_angle_differences(init_phi_errors_list, save_path, tag='init')
-        plot_phi_angle_differences(gt_phi_errors_list, save_path, tag='gt')
+        # Plot angle differences after amortized training using appropriate comparisons
+        plot_angle_differences(global_aligned_pred_rotmats_over_epochs, gt_rotmats, save_path, tag='gt')
+        plot_angle_differences(pred_rotmats_over_epochs, init_rotmats, save_path, tag='initial')
+        plot_phi_angle_differences(global_aligned_pred_rotmats_over_epochs, gt_rotmats, save_path, tag='gt')
+        plot_phi_angle_differences(pred_rotmats_over_epochs, init_rotmats, save_path, tag='initial')
 
     else:
+        print("No amortized training")
         assert args.path_to_checkpoint != "none"
         assert args.epochs_unamortized > 0
         init_ckpt_path = args.path_to_checkpoint
@@ -621,6 +698,14 @@ if __name__ == "__main__":
         model.load_state_dict(checkpoint['model'])
         init_epoch = checkpoint['epoch']
         total_time = checkpoint['total_time']
+        # Using new hyperparameters from the config file for unamortized training
+        # (optimizer states are not loaded, so values like learning rates, vol_iters, pose_iters,
+        # etc. are updated from the new config file)
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--save_path', type=str)
+        parser.add_argument('--config', type=str)
+        known_args, remaining_args = parser.parse_known_args()
+
 
     init_epoch = epochs_amortized
 
@@ -630,17 +715,14 @@ if __name__ == "__main__":
         vol_iters = args.vol_iters
         pose_iters = args.pose_iters
 
-        # create paths
-        ckpt_path = os.path.join(save_path, 'ckpt')
-        if not os.path.exists(ckpt_path):
-            os.makedirs(ckpt_path)
-        reconst_volume_paths = os.path.join(save_path, 'reconst_volumes')
-        if not os.path.exists(reconst_volume_paths):
-            os.makedirs(reconst_volume_paths)
-
         # select the best pose based on reconstruction loss
         rotmats = torch.zeros((len(dataset), 3, 3)).cuda()
         model.eval()
+        
+        # Choose the source of initial rotations for unamortized training
+
+        print("Using refined rotations from amortized training...")
+        # Use the best poses from amortized predictions
         with torch.no_grad():
             for batch, data in tqdm(enumerate(dataloader), total=len(dataloader)):
                 data_cuda = dict2cuda(data)
@@ -666,92 +748,107 @@ if __name__ == "__main__":
                 # Safely assign to the output tensor
                 rotmats[idxs] = selected_rotmats
 
-
-            if (not experimental) and (epochs_amortized == 0): # add initial results if not directly continuing from amortized training
-                # Collect rotations for plotting
-                pred_rotmats = np.zeros((len(dataset), 3, 3))
-                for data in tqdm(dataloader):
-                    data_cuda = dict2cuda(data)
-                    idxs = data_cuda['idx'].detach().cpu().numpy()
-                    out_dict = model(data_cuda, r=r, amortized=True)
-                    fproj_input = data_cuda['fproj']
-                    fproj_pred = out_dict['pred_fproj']
-                    mask = out_dict['mask']
-                    head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
-                    argmin = np.argmin(head_loss.detach().cpu().numpy(), axis=1)
-                    pred_rotmats[idxs] = out_dict['rotmat'].detach().cpu().numpy()[np.arange(len(idxs)), argmin]
-                
-                # Plot orientation distribution
-                plot_orientation_distribution(pred_rotmats, init_epoch, orientation_dist_paths)
-                
-                # Commented out GT-dependent code
-                # if not experimental:
-                #     gt_rotmats = ...  # Remove GT-related code
-                #     rot_errors_dict = compute_rot_error_single(...)
-                #     ...  # Remove metric logging
         model.train()
 
         # decoder optimizer
+        print(f"Unamortized decoder learning rate: {args.unamortized_decoder_lr}")
         decoder_params = [{'params': model.pred_map.parameters(), 'lr': args.unamortized_decoder_lr}]
         decoder_optim = torch.optim.Adam(decoder_params)
 
         # pose model
-        pose_model = PoseModel(n_data=len(dataset), rotations=rotmats)
+        print(f"Unamortized pose learning rate: {args.rot_lr}")
+        pose_model = PoseModel(n_data=len(dataset), rotations=rotmats, euler=True)
         pose_model.cuda()
+        # Optimization parameters for membrane proteins
         params = [{'params': list(filter(lambda p: p.requires_grad, pose_model.rots.parameters())), 
-                       'lr': args.rot_lr, 'betas': (0.9, 0.9)}]
+                'lr': args.rot_lr,
+                'betas': (0.9, 0.99)}]  # Higher beta2 for adaptive learning
         pose_optim = torch.optim.Adam(params)
 
         # unamortized training
         for iteration in range(epochs_unamortized):
+            print(f"Unamortized epoch {iteration+1}/{epochs_unamortized}")
             avg_loss = 0
             t1 = time.time()
-            for batch, data in enumerate(dataloader):
+            
+            # Collect all types of rotations for plotting
+            pred_rotmats = np.zeros((len(dataset), 3, 3))
+            gt_rotmats = np.zeros((len(dataset), 3, 3))
+            init_rotmats = np.zeros((len(dataset), 3, 3))
+            
+            # Perform alternating optimization of volume and poses
+            for data in tqdm(dataloader, desc="Optimizing poses and volume"):
                 data_cuda = dict2cuda(data)
-                idxs = data_cuda['idx']
-
-                # only optimize pose
-                for param in model.pred_map.parameters():
-                    param.requires_grad = False
-                for param in pose_model.parameters():
-                    param.requires_grad = True
-                for _ in range(pose_iters):
+                idxs = data_cuda['idx'].cpu().numpy()
+                
+                # Volume optimization (fixed poses)
+                for _ in range(args.vol_iters):
                     decoder_optim.zero_grad()
-                    pose_optim.zero_grad()
-                    pred_rotmat = pose_model(idxs)
+                    pred_rotmat = pose_model(torch.tensor(idxs).cuda())
                     out_dict = model(data_cuda, amortized=False, pred_rotmat=pred_rotmat, r=r)
+                    
+                    # Compute reconstruction loss
                     fproj_input = data_cuda['fproj']
                     fproj_pred = out_dict['pred_fproj']
                     mask = out_dict['mask']
-                    batch_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
-                    loss = batch_loss.mean()
-                    loss.backward()
-                    pose_optim.step()
-                    decoder_optim.zero_grad()
-                pose_model.update(idxs)
-
-                # only optimize volume
-                for param in model.pred_map.parameters():
-                    param.requires_grad = True
-                for param in pose_model.parameters():
-                    param.requires_grad = False
-                for _ in range(vol_iters):
-                    decoder_optim.zero_grad()
-                    pose_optim.zero_grad()
-                    pred_rotmat = pose_model(idxs)
-                    out_dict = model(data_cuda, amortized=False, pred_rotmat=pred_rotmat, r=r)
-                    fproj_input = data_cuda['fproj']
-                    fproj_pred = out_dict['pred_fproj']
-                    mask = out_dict['mask']
-                    batch_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
-                    loss = batch_loss.mean()
+                    loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
+                    loss = loss.mean()
+                    avg_loss += loss.item()
                     loss.backward()
                     decoder_optim.step()
-                    pose_optim.zero_grad()
                 
-                if batch % 100 == 0:
-                    print(f'Epoch {iteration}, Batch {batch}, loss: {loss.item():.3f}')
-                avg_loss += loss.item()
+                # Pose optimization (fixed volume)
+                for _ in range(args.pose_iters):
+                    pose_optim.zero_grad()
+                    pred_rotmat = pose_model(torch.tensor(idxs).cuda())
+                    out_dict = model(data_cuda, amortized=False, pred_rotmat=pred_rotmat, r=r)
+                    
+                    # Compute reconstruction loss
+                    fproj_input = data_cuda['fproj']
+                    fproj_pred = out_dict['pred_fproj']
+                    mask = out_dict['mask']
+                    loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
+                    loss = loss.mean()
+                    loss.backward()
+                    pose_optim.step()
+                
+                # Apply the accumulated rotational updates
+                pose_model.update(torch.tensor(idxs).cuda())
+                
+                # Store rotations for plotting
+                pred_rotmats[idxs] = out_dict['rotmat'].detach().cpu().numpy()
+                gt_rotmats[idxs] = data_cuda['gt_rots'].cpu().numpy()
+                init_rotmats[idxs] = data_cuda['init_rots'].cpu().numpy()
+            
+            # Perform global alignment on all collected predictions
+            global_aligned_pred_rotmats, _, _, _ = global_alignment(pred_rotmats, gt_rotmats)
+            
+            # Save this epoch's rotations if tracking over time
+            if 'pred_rotmats_over_epochs_unamortized' not in locals():
+                pred_rotmats_over_epochs_unamortized = []
+                global_aligned_pred_rotmats_over_epochs_unamortized = []
+            
+            pred_rotmats_over_epochs_unamortized.append(pred_rotmats.copy())
+            global_aligned_pred_rotmats_over_epochs_unamortized.append(global_aligned_pred_rotmats.copy())
+            
+            # Plot orientation distribution using original predictions
+            plot_orientation_distribution(pred_rotmats, iteration + init_epoch, orientation_dist_paths)
+            
+            # Use globally aligned predictions for GT comparisons and original predictions for initial comparisons
+            plot_error_histograms(global_aligned_pred_rotmats, gt_rotmats, iteration + init_epoch, save_path, tag='gt')
+            plot_error_histograms(pred_rotmats, init_rotmats, iteration + init_epoch, save_path, tag='initial')
+            plot_error_scatter(global_aligned_pred_rotmats, gt_rotmats, iteration + init_epoch, save_path, tag='gt')
+            plot_error_scatter(pred_rotmats, init_rotmats, iteration + init_epoch, save_path, tag='initial')
+            plot_pred_vs_gt_scatter(global_aligned_pred_rotmats, gt_rotmats, iteration + init_epoch, save_path, tag='aligned')
+            plot_pred_vs_gt_scatter(pred_rotmats, gt_rotmats, iteration + init_epoch, save_path, tag='unaligned')
+            
+            # If last epoch, plot trends over time using appropriate comparisons
+            if iteration == epochs_unamortized - 1:
+                plot_angle_differences(global_aligned_pred_rotmats_over_epochs_unamortized, gt_rotmats, save_path, tag='gt_unamortized')
+                plot_angle_differences(pred_rotmats_over_epochs_unamortized, init_rotmats, save_path, tag='initial_unamortized')
+                plot_phi_angle_differences(global_aligned_pred_rotmats_over_epochs_unamortized, gt_rotmats, save_path, tag='gt_unamortized')
+                plot_phi_angle_differences(pred_rotmats_over_epochs_unamortized, init_rotmats, save_path, tag='initial_unamortized')
+
             t2 = time.time()
             avg_loss /= len(dataloader)
             writer.add_scalar('avg_loss', avg_loss, iteration + 1 + init_epoch)
@@ -764,38 +861,6 @@ if __name__ == "__main__":
                 vol = model.pred_map.make_volume(r=r)
                 filename = os.path.join(reconst_volume_paths, f'ep_{iteration + init_epoch}.mrc')
                 save_mrc(filename, vol, voxel_size=resolution, header_origin=None)
-                
-                # Collect rotations for plotting
-                pred_rotmats = np.zeros((len(dataset), 3, 3))
-                for data in tqdm(dataloader):
-                    data_cuda = dict2cuda(data)
-                    idxs = data_cuda['idx'].detach().cpu().numpy()
-                    out_dict = model(data_cuda, r=r, amortized=True)
-                    fproj_input = data_cuda['fproj']
-                    fproj_pred = out_dict['pred_fproj']
-                    mask = out_dict['mask']
-                    
-                    # Move computations to CPU and ensure proper shapes
-                    batch_head_loss = ((torch.abs(fproj_pred - fproj_input) * mask).sum((-1, -2))) / mask.sum((-1, -2))
-                    batch_min_head_idx = torch.argmin(batch_head_loss, dim=1).cpu().numpy()
-                    
-                    # Move rotations to CPU and reshape
-                    rotmats_batch = out_dict['rotmat'].detach().cpu().numpy()
-                    batch_size = len(idxs)
-                    rotmats_batch = rotmats_batch.reshape(batch_size, -1, 3, 3)
-                    
-                    # Select best rotation for each sample
-                    for i, idx in enumerate(idxs):
-                        pred_rotmats[idx] = rotmats_batch[i, batch_min_head_idx[i]]
-                
-                # Plot orientation distribution
-                plot_orientation_distribution(pred_rotmats, iteration + init_epoch, orientation_dist_paths)
-                
-                # Commented out GT-dependent code
-                # if not experimental:
-                #     gt_rotmats = ...  # Remove GT-related code
-                #     rot_errors_dict = compute_rot_error_single(...)
-                #     ...  # Remove metric logging
 
                 # save model and optimizer states
                 checkpoint = { 
@@ -806,4 +871,5 @@ if __name__ == "__main__":
                     'pose_optimizer': pose_optim.state_dict(),
                     'decoder_optimizer': decoder_optim.state_dict()}
                 # torch.save(checkpoint, os.path.join(ckpt_path, f'ep_{iteration + init_epoch + 1}.pth'))
+        
     writer.close()

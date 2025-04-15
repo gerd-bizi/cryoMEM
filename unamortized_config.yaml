@@ -1,0 +1,20 @@
+amortized_method: split_reg
+batch_size: 16
+data_type: random_membrane_w_wobble
+decoder_lr: 0.01
+encoder_lr: 0.00001
+epochs_amortized: 0
+epochs_unamortized: 15
+
+num_rotations: 1
+path_to_checkpoint: /h/bizigerd/semi-amortized-cryoem_2/test_smth_amor/ckpt/ep_9.pth
+pose_iters: 5
+prior: 'false'
+r: 1.0
+rot_lr: 0.01
+space: hartley
+unamortized_decoder_lr: 0.005
+uninvert_data: false
+vol_iters: 5
+w1: 0
+w2: 0

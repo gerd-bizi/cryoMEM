@@ -502,7 +502,7 @@ class UnitCirclePhiRegressor(nn.Module):
         return phi_unit
     
 class ResidualAngleRegressor(nn.Module):
-    def __init__(self, latent_dim, angle_dim=2, hidden_features=[256, 128], max_delta=np.deg2rad(10)):
+    def __init__(self, latent_dim, angle_dim=1, hidden_features=[256, 128], max_delta=np.deg2rad(15)):
         """
         Parameters:
         -----------
@@ -519,7 +519,7 @@ class ResidualAngleRegressor(nn.Module):
         self.max_delta = max_delta
         # The network takes as input both the latent code and the initial angles
         self.fc = FCBlock(
-            in_features=latent_dim + angle_dim,
+            in_features=latent_dim,
             features=hidden_features,
             out_features=angle_dim,
             nonlinearity='relu',
@@ -528,11 +528,9 @@ class ResidualAngleRegressor(nn.Module):
         )
 
     def forward(self, latent, init_angles):
-        # Concatenate the latent code with the initial angle estimates.
-        x = torch.cat([latent, init_angles], dim=1)
         # The tanh output, scaled, ensures the residual is in [-max_delta, max_delta].
-        delta = self.fc(x) * self.max_delta
-        return delta
+        delta = self.fc(latent) * self.max_delta
+        return init_angles + delta
     
 class GatedResidualAngleRegressor(nn.Module):
     def __init__(self, latent_dim, angle_dim=2, hidden_features=[256, 128], max_delta=np.deg2rad(10)):
@@ -565,4 +563,26 @@ class GatedResidualAngleRegressor(nn.Module):
         gate = self.gate_fc(x)
         # Blend: gate close to 1 means trusting the initial guess more.
         refined_angles = gate * init_angles + (1 - gate) * (init_angles + delta)
+        return refined_angles
+    
+
+class NonGatedResidualAngleRegressor(nn.Module):
+    def __init__(self, latent_dim, angle_dim=1, hidden_features=[256, 128], max_delta=np.deg2rad(15)):
+        super(NonGatedResidualAngleRegressor, self).__init__()
+        self.max_delta = max_delta
+        
+        # Delta branch: predicts the correction
+        self.delta_fc = FCBlock(
+            in_features=latent_dim + angle_dim,
+            features=hidden_features,
+            out_features=angle_dim,
+            nonlinearity='relu',
+            last_nonlinearity='tanh',  # output in [-1, 1]
+            batch_norm=True
+        )
+
+    def forward(self, latent, init_angles):
+        x = torch.cat([latent, init_angles], dim=1)
+        delta = self.delta_fc(x) * self.max_delta
+        refined_angles = init_angles + delta
         return refined_angles
