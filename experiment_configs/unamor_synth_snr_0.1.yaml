@@ -1,0 +1,27 @@
+amortized_method: in_membrane
+batch_size: 64
+data_type: random_membrane_w_wobble
+snr: 1.0
+decoder_lr: 0.05
+encoder_lr: 0.00005
+in_membrane_lr: 0.0005
+epochs_amortized: 0
+epochs_unamortized: 15
+heads: 1
+
+vol_rep: explicit
+
+big_dataset: False
+
+
+path_to_checkpoint: '/datasets/empiar/final/amor_synth_snr_0.1/ckpt/ep_9.pth'
+pose_iters: 5
+prior: 'false'
+r: 1.0
+rot_lr: 0.001
+space: hartley
+unamortized_decoder_lr: 0.001
+uninvert_data: false
+vol_iters: 1
+w1: 0
+w2: 0

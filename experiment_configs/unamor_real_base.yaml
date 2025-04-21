@@ -1,0 +1,23 @@
+amortized_method: in_membrane
+batch_size: 128
+data_type: real
+decoder_lr: 0.01
+encoder_lr: 0.0001
+in_membrane_lr: 0.005
+epochs_amortized: 0
+epochs_unamortized: 30
+heads: 9
+vol_rep: explicit
+
+
+path_to_checkpoint: '/datasets/empiar/final/amor_real_base/ckpt/ep_14.pth'
+pose_iters: 15
+prior: 'false'
+r: 1.0
+rot_lr: 0.03
+space: hartley
+unamortized_decoder_lr: 0.07
+uninvert_data: false
+vol_iters: 1
+w1: 0
+w2: 0

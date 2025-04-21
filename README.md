@@ -49,7 +49,7 @@ python train_semi-amortized.py --config ./configs/train_synth.yaml --save_path p
 ```
 which will write the reconstruction logs in `path/to/save/logs`. You can run `tensorboard` to see several curves such as reconstruction error and mean/median rotation errors.
 
-Within the config file `train.yaml`, several hyperparameters are defined. An important one is `num_rotations` which determines number of heads of CNN encoder during auto-encoding stage.
+Within the config file `train.yaml`, several hyperparameters are defined. An important one is `heads` which determines number of heads of CNN encoder during auto-encoding stage.
 Moreover, `epochs_amortized` and `epochs_unamortized` specify number of epochs spent on auto-encoding and auto-decoding stages, respectively.
 We provide a brief description for each hyperparamter in the config file.
 

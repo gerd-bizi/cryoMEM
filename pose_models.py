@@ -113,6 +113,81 @@ class ShiftModel(nn.Module):
     def forward(self, idx):
         return self.shifts[idx]
         
+class PerturbationEulerRotModel(nn.Module):
+    def __init__(self, n_data, rotations=None):
+        super(PerturbationEulerRotModel, self).__init__()
+        # Convert initial rotation matrices to Euler angles (ZYZ convention)
+        euler_angles = matrix_to_euler_angles(rotations, convention="ZYZ")
+        
+        # Base parameters (non-perturbed)
+        self.n_data = n_data
+        
+        # For psi (in-plane rotation)
+        psi = euler_angles[:, 0]
+        self.psi_cos = nn.Parameter(torch.cos(psi), requires_grad=False)
+        self.psi_sin = nn.Parameter(torch.sin(psi), requires_grad=False)
+        
+        # For theta (tilt angle)
+        self.theta = nn.Parameter(euler_angles[:, 1], requires_grad=False)
+        
+        # For phi (in-membrane rotation)
+        phi = euler_angles[:, 2]
+        self.phi_cos = nn.Parameter(torch.cos(phi), requires_grad=False)
+        self.phi_sin = nn.Parameter(torch.sin(phi), requires_grad=False)
+        
+        # Perturbation parameters that will be optimized
+        self.psi_delta = nn.Parameter(torch.zeros(n_data), requires_grad=True)
+        self.theta_delta = nn.Parameter(torch.zeros(n_data), requires_grad=True)
+        self.phi_delta = nn.Parameter(torch.zeros(n_data), requires_grad=True)
+        
+    def update(self, idx):
+        with torch.no_grad():
+            # Apply perturbations to the base angles
+            psi = torch.atan2(self.psi_sin[idx], self.psi_cos[idx]) + self.psi_delta[idx]
+            self.psi_cos.data[idx] = torch.cos(psi)
+            self.psi_sin.data[idx] = torch.sin(psi)
+            
+            # Update theta with clamping
+            self.theta.data[idx] = torch.clamp(self.theta[idx] + self.theta_delta[idx], 0.0, math.pi)
+            
+            # Update phi
+            phi = torch.atan2(self.phi_sin[idx], self.phi_cos[idx]) + self.phi_delta[idx]
+            self.phi_cos.data[idx] = torch.cos(phi)
+            self.phi_sin.data[idx] = torch.sin(phi)
+            
+            # Reset perturbations to zero for next iteration
+            self.psi_delta.data[idx].zero_()
+            self.theta_delta.data[idx].zero_()
+            self.phi_delta.data[idx].zero_()
+    
+    def get_euler_angles(self, idx=None):
+        if idx is None:
+            # Get base angles
+            psi_base = torch.atan2(self.psi_sin, self.psi_cos)
+            theta_base = self.theta
+            phi_base = torch.atan2(self.phi_sin, self.phi_cos)
+            
+            # Apply perturbations
+            psi = psi_base + self.psi_delta
+            theta = torch.clamp(theta_base + self.theta_delta, 0.0, math.pi)
+            phi = phi_base + self.phi_delta
+        else:
+            # Same but only for specified indices
+            psi_base = torch.atan2(self.psi_sin[idx], self.psi_cos[idx])
+            theta_base = self.theta[idx]
+            phi_base = torch.atan2(self.phi_sin[idx], self.phi_cos[idx])
+            
+            psi = psi_base + self.psi_delta[idx]
+            theta = torch.clamp(theta_base + self.theta_delta[idx], 0.0, math.pi)
+            phi = phi_base + self.phi_delta[idx]
+        
+        return torch.stack([psi, theta, phi], dim=-1)
+    
+    def forward(self, idx):
+        """Convert current parameters to rotation matrices"""
+        euler_angles = self.get_euler_angles(idx)
+        return euler_angles_to_matrix(euler_angles, convention="ZYZ")
+
 class PoseModel(nn.Module):
     def __init__(self, n_data, rotations=None, shifts=None, shift_grad=True, euler=False):
         super(PoseModel, self).__init__()
@@ -130,8 +205,6 @@ class PoseModel(nn.Module):
         if self.euler is False:
             with torch.no_grad():
                 self.rots.update(idx)
-        else:
-            self.rots.normalize_circular_params(idx)
     
     def forward(self, idx):
         rots = self.rots(idx)

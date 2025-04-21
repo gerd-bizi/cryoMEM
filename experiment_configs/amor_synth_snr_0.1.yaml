@@ -1,0 +1,26 @@
+amortized_method: in_membrane
+batch_size: 64
+data_type: random_membrane_w_wobble
+snr: 0.1
+decoder_lr: 0.01
+encoder_lr: 0.0001
+in_membrane_lr: 0.0005
+epochs_amortized: 10
+epochs_unamortized: 0
+heads: 1
+
+vol_rep: explicit
+
+big_dataset: False
+
+
+path_to_checkpoint: none
+pose_iters: 5
+prior: 'false'
+r: 1.0
+rot_lr: 0.05
+space: hartley
+unamortized_decoder_lr: 0.1
+uninvert_data: false
+vol_iters: 1
+

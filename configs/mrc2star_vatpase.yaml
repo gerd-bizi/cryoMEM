@@ -2,7 +2,7 @@ mrc: '/h/bizigerd/semi-amortized-cryoem_2/synthetic_data/cryosparc_P179_J3366_cl
 resolution: 4.02
 sidelen: 128
 num_projs: 6116
-snr: 1.0
+snr: 0.1
 power_signal: 0.1
 ctf_precompute: true
-output_dir: '/datasets/empiar/vatpase_synth'
+output_dir: '/datasets/empiar/vatpase_synth_snr_0.1'

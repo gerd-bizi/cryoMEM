@@ -247,7 +247,7 @@ class DensityMapProjectionSimulator(Dataset):
         # if euler_angles is not None:
         #     self.num_projs = len(euler_angles)
         #     # Convert degrees to radians and create rotation matrices
-        #     euler_angles_rad = np.radians(euler_angles)
+        #     euler_angles_rad = np.deg2rad(euler_angles)
         #     self.rotmat = torch.zeros((self.num_projs, 3, 3))
         #     for i in range(self.num_projs):
         #         # Convert ZYZ Euler angles to rotation matrix
@@ -424,11 +424,11 @@ def create_uniform_angle_distribution(num_projs):
         rot = phi
         psi = np.random.uniform(0, 360)  # Random in-plane rotation
         
-        angles[i] = [np.degrees(rot), np.degrees(tilt), psi]
+        angles[i] = [np.rad2deg(rot), np.rad2deg(tilt), psi]
     
     return angles
 
-def create_preferred_angle_distribution(num_projs, preferred_tilt=90, tilt_std=10):
+def create_preferred_angle_distribution(num_projs, preferred_tilt=90, tilt_std=15):
     """
     Creates a distribution of Euler angles with preferred orientations.
     
@@ -450,9 +450,9 @@ def create_preferred_angle_distribution(num_projs, preferred_tilt=90, tilt_std=1
     
     # Generate angles with preferred orientation
     for i in range(num_projs):
-        psi = np.radians(np.random.uniform(-180, 180))
+        psi = np.deg2rad(np.random.uniform(-15, 15))
 
-        # psi = np.radians(np.random.uniform(-10, 10))
+        # psi = np.deg2rad(np.random.uniform(-10, 10))
 
         # psi refers to the in-plane rotation of the particle
         # When using default mrcfile
@@ -461,10 +461,10 @@ def create_preferred_angle_distribution(num_projs, preferred_tilt=90, tilt_std=1
         # psi = 90 -> particle points down
         # psi = 180 -> particle points left
         tilt_delta = tilt_std * np.random.uniform(-1, 1)
-        tilt = np.radians(preferred_tilt + tilt_delta)  # Ensure valid tilt angle
+        tilt = np.deg2rad(preferred_tilt + tilt_delta)  # Ensure valid tilt angle
         # tilt = 0 -> particle is perpendicular to screen
         # tilt = 90 -> particle is parallel to screen, thus equatorial view
-        rot = np.radians(np.random.uniform(-180, 180))
+        rot = np.deg2rad(np.random.uniform(-180, 180))
         # rot corresponds to the in-membrane rotation of the particle
         # i.e. the one that we have no prior over
 
@@ -649,7 +649,7 @@ if __name__ == '__main__':
             B = projs.shape[0]
             S = projs.shape[-1]
             rotmats = model_input['rotmat']  # B, 3, 3
-            euler_angles_deg = np.degrees(pytorch3d.transforms.matrix_to_euler_angles(rotmats, 'ZYZ').float().numpy())  # B, 3
+            euler_angles_deg = np.rad2deg(pytorch3d.transforms.matrix_to_euler_angles(rotmats, 'ZYZ').float().numpy())  # B, 3
             defocusU = model_input['defocusU'].float().numpy()  # B, 1, 1
             defocusV = model_input['defocusV'].float().numpy()  # B, 1, 1
             angleAstigmatism = model_input['angleAstigmatism'].float().numpy()  # B, 1, 1
@@ -669,7 +669,7 @@ if __name__ == '__main__':
                 rlnImageName.append(image_name)
                 rlnDefocusU.append(defocusU[i, 0, 0] * 1e4)
                 rlnDefocusV.append(defocusV[i, 0, 0] * 1e4)
-                rlnDefocusAngle.append(np.degrees(angleAstigmatism[i, 0, 0]))
+                rlnDefocusAngle.append(np.rad2deg(angleAstigmatism[i, 0, 0]))
                 rlnOriginXAngst.append(shiftX[i, 0, 0])
                 rlnOriginYAngst.append(shiftY[i, 0, 0])
                 rlnAngleRot.append(-euler_angles_deg[i, 2])  # to be consistent with RELION dataio (cf dataio.py)

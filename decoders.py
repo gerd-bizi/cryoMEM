@@ -4,9 +4,6 @@ import numpy as np
 import torch.nn.functional as F
 from abc import ABCMeta, abstractmethod
 from utils.ctf import fourier_to_primal_3D
-from utils.nets import SIREN, FCBlock, FourierNet
-from utils.nets import PositionalEncoding
-from utils.frequency_marcher import FrequencyMarcher
 
 
 class Explicit3D(nn.Module):

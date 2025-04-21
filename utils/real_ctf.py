@@ -16,10 +16,10 @@ def print_ctf_params(params: np.ndarray) -> None:
 
     
 class ExperimentalCTF(nn.Module):
-    def __init__(self):
+    def __init__(self, file_path_1, file_path_2):
         super(ExperimentalCTF, self).__init__()
-        cs_file_path_1 = '/h/bizigerd/rotation_debugging/angle_estimated_equatorial_particles_rotation_matrix.cs'
-        cs_file_path_2 = '/h/bizigerd/rotation_debugging/angle_estimated_equatorial_particles_passthrough_rotation_matrix.cs'
+        cs_file_path_1 = file_path_1
+        cs_file_path_2 = file_path_2
         metadata1 = np.load(cs_file_path_1)
         metadata2 = np.load(cs_file_path_2)
 
