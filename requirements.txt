@@ -1,0 +1,11 @@
+scipy==1.9.3
+scikit-image==0.22.0
+tqdm
+PyYAML
+matplotlib
+kornia
+notebook
+tensorboard
+numpy==1.23.4
+starfile==0.4.5
+mrcfile
